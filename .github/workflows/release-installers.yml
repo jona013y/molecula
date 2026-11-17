@@ -15,8 +15,8 @@ jobs:
         shell: pwsh
         run: Expand-Archive -Path Molecula-source.zip -DestinationPath source
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
+      - name: Install Inno Setup and 7-Zip
+        run: choco install innosetup 7zip --no-progress -y
       - name: Build and test Windows installer
         shell: pwsh
         working-directory: source
@@ -27,6 +27,15 @@ jobs:
           path: source/dist/windows/Molecula-Windows-Setup.exe
           if-no-files-found: error
           retention-days: 30
+      - name: Prepare Mesa software OpenGL for VM
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
+          $mesaRoot = Join-Path $env:RUNNER_TEMP "mesa"
+          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.7/mesa3d-26.2.7-release-msvc.7z" -OutFile $archive
+          New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
+          & 7z.exe x $archive "-o$mesaRoot" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not extract Mesa OpenGL test driver" }
       - name: Install and launch app in Windows VM
         shell: pwsh
         working-directory: source
@@ -38,6 +47,11 @@ jobs:
           if (-not (Test-Path $appPath)) { throw "Installed app not found at $appPath" }
           $logPath = Join-Path $env:LOCALAPPDATA "Molecula\startup.log"
           Remove-Item $logPath -ErrorAction SilentlyContinue
+          $mesaDll = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP "mesa") -Filter opengl32.dll -File -Recurse | Where-Object { $_.DirectoryName -match "x64" } | Select-Object -First 1
+          if (-not $mesaDll) { throw "Mesa x64 OpenGL runtime not found in archive" }
+          Copy-Item (Join-Path $mesaDll.DirectoryName "*.dll") (Split-Path $appPath) -Force
+          $env:GALLIUM_DRIVER = "llvmpipe"
+          $env:LIBGL_ALWAYS_SOFTWARE = "1"
           $app = Start-Process -FilePath $appPath -PassThru
           Start-Sleep -Seconds 8
           $app.Refresh()
