@@ -71,17 +71,3 @@ jobs:
             gh release create "$RELEASE_TAG" --title "Molecula $RELEASE_TAG" --generate-notes
           fi
           gh release upload "$RELEASE_TAG" dist/Molecula-Windows-Setup.exe --clobber
-
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Publish the Windows installer
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --title "Molecula $RELEASE_TAG" --generate-notes
-          fi
-          gh release upload "$RELEASE_TAG" dist/Molecula-Windows-Setup.exe --clobber
