@@ -34,8 +34,14 @@ jobs:
           $mesaRoot = Join-Path $env:RUNNER_TEMP "mesa"
           Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.7/mesa3d-26.2.7-release-msvc.7z" -OutFile $archive
           New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
-          & 7z.exe x $archive "-o$mesaRoot" -y | Out-Null
+          Write-Host "Mesa archive bytes: $((Get-Item $archive).Length)"
+          & 7z.exe l $archive
+          & 7z.exe x $archive "-o$mesaRoot" -y
           if ($LASTEXITCODE -ne 0) { throw "Could not extract Mesa OpenGL test driver" }
+          Write-Host "Mesa extracted directories:"
+          Get-ChildItem -Path $mesaRoot -Recurse -Directory | Select-Object -First 60 -ExpandProperty FullName | Write-Host
+          Write-Host "Mesa extracted DLLs:"
+          Get-ChildItem -Path $mesaRoot -Recurse -File | Where-Object { $_.Extension -eq ".dll" } | Select-Object -First 60 -ExpandProperty FullName | Write-Host
       - name: Install and launch app in Windows VM
         shell: pwsh
         working-directory: source
