@@ -47,10 +47,11 @@ jobs:
           if (-not (Test-Path $appPath)) { throw "Installed app not found at $appPath" }
           $logPath = Join-Path $env:LOCALAPPDATA "Molecula\startup.log"
           Remove-Item $logPath -ErrorAction SilentlyContinue
-                    $mesaFiles = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP "mesa") -Filter opengl32.dll -File -Recurse
-          $mesaFiles | ForEach-Object { Write-Host "Mesa OpenGL runtime found at $($_.FullName)" }
-          $mesaDll = $mesaFiles | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1
-          if (-not $mesaDll) { throw "Mesa x64 OpenGL runtime not found; see the candidate paths above" }
+                    $mesaRoot = Join-Path $env:RUNNER_TEMP "mesa"
+          $mesaFiles = Get-ChildItem -Path $mesaRoot -Recurse -File | Where-Object { $_.Name -in @("opengl32.dll", "libgallium_wgl.dll") }
+          $mesaFiles | ForEach-Object { Write-Host "Mesa candidate: $($_.FullName)" }
+          $mesaDll = $mesaFiles | Where-Object { $_.Name -eq "opengl32.dll" -and $_.FullName.Contains("x64") } | Select-Object -First 1
+          if (-not $mesaDll) { throw "Mesa x64 OpenGL runtime missing; archive candidates are listed above" }
           Copy-Item (Join-Path $mesaDll.DirectoryName "*.dll") (Split-Path $appPath) -Force
           $env:GALLIUM_DRIVER = "llvmpipe"
           $env:LIBGL_ALWAYS_SOFTWARE = "1"
