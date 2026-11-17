@@ -7,30 +7,6 @@ on:
 permissions:
   contents: write
 jobs:
-  macos:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - name: Unpack project source
-        run: unzip -q Molecula-source.zip -d source
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - name: Test
-        working-directory: source
-        run: cargo test --locked
-      - name: Build universal app
-        working-directory: source
-        run: |
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
-          bash scripts/package_macos.sh universal
-      - uses: actions/upload-artifact@v4
-        with:
-          name: molecula-macos
-          path: source/dist/Molecula-macOS-universal.dmg
-          if-no-files-found: error
-          retention-days: 30
   windows:
     runs-on: windows-latest
     steps:
@@ -53,14 +29,15 @@ jobs:
           retention-days: 30
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows]
+    needs: [windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Publish both installers
+      - name: Publish the Windows installer
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -69,4 +46,4 @@ jobs:
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --title "Molecula $RELEASE_TAG" --generate-notes
           fi
-          gh release upload "$RELEASE_TAG" dist/Molecula-macOS-universal.dmg dist/Molecula-Windows-Setup.exe --clobber
+          gh release upload "$RELEASE_TAG" dist/Molecula-Windows-Setup.exe --clobber
