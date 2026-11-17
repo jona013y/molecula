@@ -7,11 +7,38 @@ on:
 permissions:
   contents: write
 jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack Molecula source
+        run: unzip -q Molecula-source.zip -d source
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install universal Mac targets
+        working-directory: source
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Test Mac source
+        working-directory: source
+        run: cargo test --locked
+      - name: Build Apple Silicon and Intel apps
+        working-directory: source
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Package universal Mac app
+        working-directory: source
+        run: bash scripts/package_macos.sh universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: molecula-macos
+          path: source/dist/Molecula-macOS-universal.dmg
+          if-no-files-found: error
+          retention-days: 30
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unpack project source
+      - name: Unpack Molecula source
         shell: pwsh
         run: Expand-Archive -Path Molecula-source.zip -DestinationPath source
       - uses: dtolnay/rust-toolchain@stable
@@ -56,7 +83,7 @@ jobs:
           path: source/dist/windows/Molecula-Windows-Setup.exe
           if-no-files-found: error
           retention-days: 30
-      - name: Install and launch the packaged app in Windows VM
+      - name: Install and launch packaged app in Windows VM
         shell: pwsh
         working-directory: source
         run: |
@@ -65,8 +92,7 @@ jobs:
           if ($setup.ExitCode -ne 0) { throw "Installer exited with code $($setup.ExitCode)" }
           $appPath = Join-Path $env:LOCALAPPDATA "Programs\Molecula\Molecula.exe"
           if (-not (Test-Path $appPath)) { throw "Installed app not found at $appPath" }
-          $mesaPath = Split-Path $appPath
-          if (-not (Test-Path (Join-Path $mesaPath "opengl32.dll"))) { throw "Installer did not include Mesa opengl32.dll" }
+          if (-not (Test-Path (Join-Path (Split-Path $appPath) "opengl32.dll"))) { throw "Installer did not include Mesa opengl32.dll" }
           $logPath = Join-Path $env:LOCALAPPDATA "Molecula\startup.log"
           if (-not (Test-Path $logPath)) { throw "Installer did not create the startup log" }
           $env:GALLIUM_DRIVER = "llvmpipe"
@@ -74,27 +100,19 @@ jobs:
           $app = Start-Process -FilePath $appPath -PassThru
           Start-Sleep -Seconds 8
           $app.Refresh()
-          if ($app.HasExited) {
-            Get-Content $logPath | Write-Host
-            throw "Packaged app exited during Windows VM smoke test"
-          }
-          if ($app.MainWindowHandle -eq 0) {
-            Stop-Process -Id $app.Id -Force
-            Get-Content $logPath | Write-Host
-            throw "Molecula remained running but did not create a main window"
-          }
+          if ($app.HasExited) { Get-Content $logPath | Write-Host; throw "Packaged app exited during Windows VM smoke test" }
+          if ($app.MainWindowHandle -eq 0) { Stop-Process -Id $app.Id -Force; Get-Content $logPath | Write-Host; throw "Molecula did not create a main window" }
           Stop-Process -Id $app.Id -Force
   release:
-    if: startsWith(github.ref, 'refs/tags/v') && always()
-    needs: [windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Publish the Windows installer
+      - name: Publish Mac and Windows installers
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -103,4 +121,4 @@ jobs:
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --title "Molecula $RELEASE_TAG" --generate-notes
           fi
-          gh release upload "$RELEASE_TAG" dist/Molecula-Windows-Setup.exe --clobber
+          gh release upload "$RELEASE_TAG" dist/Molecula-macOS-universal.dmg dist/Molecula-Windows-Setup.exe --clobber
