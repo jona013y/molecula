@@ -32,7 +32,7 @@ jobs:
         run: |
           $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
           $mesaRoot = Join-Path $env:RUNNER_TEMP "mesa"
-          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.7/mesa3d-26.2.7-release-msvc.7z" -OutFile $archive
+          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.5/mesa3d-26.2.5-release-msvc.7z" -OutFile $archive
           New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
           Write-Host "Mesa archive bytes: $((Get-Item $archive).Length)"
           & 7z.exe l $archive
