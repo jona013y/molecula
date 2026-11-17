@@ -17,6 +17,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Inno Setup and 7-Zip
         run: choco install innosetup 7zip --no-progress -y
+      - name: Stage Mesa software OpenGL runtime and notices
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
+          $mesaRoot = Join-Path $env:RUNNER_TEMP "mesa"
+          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.5/mesa3d-26.2.5-release-msvc.7z" -OutFile $archive
+          New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
+          & 7z.exe x $archive "-o$mesaRoot" -y
+          if ($LASTEXITCODE -ne 0) { throw "Could not extract Mesa OpenGL runtime" }
+          $mesaDll = Get-ChildItem -Path $mesaRoot -Recurse -File | Where-Object { $_.Name -eq "opengl32.dll" -and $_.FullName -match "(?i)x64" } | Select-Object -First 1
+          if (-not $mesaDll) { throw "Mesa x64 opengl32.dll was not found" }
+          $stage = Join-Path $PWD "source/dist/windows/mesa"
+          $notices = Join-Path $PWD "source/dist/windows/mesa-notices"
+          New-Item -ItemType Directory -Force -Path $stage, $notices | Out-Null
+          $dlls = Get-ChildItem -Path $mesaDll.DirectoryName -Filter "*.dll" -File
+          if (-not ($dlls | Where-Object { $_.Name -eq "opengl32.dll" })) { throw "Mesa OpenGL loader is missing" }
+          Copy-Item $dlls.FullName $stage -Force
+          $licenseUrl = "https://raw.githubusercontent.com/pal1000/mesa-dist-win/26.2.5/LICENSE"
+          Invoke-WebRequest -Uri $licenseUrl -OutFile (Join-Path $notices "mesa-dist-win-LICENSE.txt")
+          $license = Get-Content (Join-Path $notices "mesa-dist-win-LICENSE.txt") -Raw
+          if ($license -notmatch "MIT License") { throw "Mesa distribution license notice could not be verified" }
+          @"
+          Molecula bundles Mesa 3D software OpenGL runtime 26.2.5 from pal1000/mesa-dist-win.
+          Upstream project: https://github.com/pal1000/mesa-dist-win
+          Release: https://github.com/pal1000/mesa-dist-win/releases/tag/26.2.5
+          The upstream MIT license is included in this directory.
+          The application uses Mesa llvmpipe CPU rendering on Windows for compatibility.
+          "@ | Set-Content (Join-Path $notices "Molecula-Mesa-notice.txt")
+          Write-Host "Staged Mesa runtime DLLs: $($dlls.Count)"
       - name: Build and test Windows installer
         shell: pwsh
         working-directory: source
@@ -27,22 +56,7 @@ jobs:
           path: source/dist/windows/Molecula-Windows-Setup.exe
           if-no-files-found: error
           retention-days: 30
-      - name: Prepare Mesa software OpenGL for VM
-        shell: pwsh
-        run: |
-          $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
-          $mesaRoot = Join-Path $env:RUNNER_TEMP "mesa"
-          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.5/mesa3d-26.2.5-release-msvc.7z" -OutFile $archive
-          New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
-          Write-Host "Mesa archive bytes: $((Get-Item $archive).Length)"
-          & 7z.exe l $archive
-          & 7z.exe x $archive "-o$mesaRoot" -y
-          if ($LASTEXITCODE -ne 0) { throw "Could not extract Mesa OpenGL test driver" }
-          Write-Host "Mesa extracted directories:"
-          Get-ChildItem -Path $mesaRoot -Recurse -Directory | Select-Object -First 60 -ExpandProperty FullName | Write-Host
-          Write-Host "Mesa extracted DLLs:"
-          Get-ChildItem -Path $mesaRoot -Recurse -File | Where-Object { $_.Extension -eq ".dll" } | Select-Object -First 60 -ExpandProperty FullName | Write-Host
-      - name: Install and launch app in Windows VM
+      - name: Install and launch the packaged app in Windows VM
         shell: pwsh
         working-directory: source
         run: |
@@ -51,26 +65,22 @@ jobs:
           if ($setup.ExitCode -ne 0) { throw "Installer exited with code $($setup.ExitCode)" }
           $appPath = Join-Path $env:LOCALAPPDATA "Programs\Molecula\Molecula.exe"
           if (-not (Test-Path $appPath)) { throw "Installed app not found at $appPath" }
+          $mesaPath = Split-Path $appPath
+          if (-not (Test-Path (Join-Path $mesaPath "opengl32.dll"))) { throw "Installer did not include Mesa opengl32.dll" }
           $logPath = Join-Path $env:LOCALAPPDATA "Molecula\startup.log"
-          Remove-Item $logPath -ErrorAction SilentlyContinue
-                    $mesaRoot = Join-Path $env:RUNNER_TEMP "mesa"
-          $mesaFiles = Get-ChildItem -Path $mesaRoot -Recurse -File | Where-Object { $_.Name -in @("opengl32.dll", "libgallium_wgl.dll") }
-          $mesaFiles | ForEach-Object { Write-Host "Mesa candidate: $($_.FullName)" }
-          $mesaDll = $mesaFiles | Where-Object { $_.Name -eq "opengl32.dll" -and $_.FullName.Contains("x64") } | Select-Object -First 1
-          if (-not $mesaDll) { throw "Mesa x64 OpenGL runtime missing; archive candidates are listed above" }
-          Copy-Item (Join-Path $mesaDll.DirectoryName "*.dll") (Split-Path $appPath) -Force
+          if (-not (Test-Path $logPath)) { throw "Installer did not create the startup log" }
           $env:GALLIUM_DRIVER = "llvmpipe"
           $env:LIBGL_ALWAYS_SOFTWARE = "1"
           $app = Start-Process -FilePath $appPath -PassThru
           Start-Sleep -Seconds 8
           $app.Refresh()
           if ($app.HasExited) {
-            if (Test-Path $logPath) { Get-Content $logPath | Write-Host }
-            throw "Installed app exited during Windows VM smoke test"
+            Get-Content $logPath | Write-Host
+            throw "Packaged app exited during Windows VM smoke test"
           }
           if ($app.MainWindowHandle -eq 0) {
             Stop-Process -Id $app.Id -Force
-            if (Test-Path $logPath) { Get-Content $logPath | Write-Host }
+            Get-Content $logPath | Write-Host
             throw "Molecula remained running but did not create a main window"
           }
           Stop-Process -Id $app.Id -Force
