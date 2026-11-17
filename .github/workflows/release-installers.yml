@@ -39,47 +39,6 @@ jobs:
           $logPath = Join-Path $env:LOCALAPPDATA "Molecula\startup.log"
           Remove-Item $logPath -ErrorAction SilentlyContinue
           $app = Start-Process -FilePath $appPath -PassThru
-name: Build Molecula installers
-on:
-  workflow_dispatch:
-  push:
-    branches: [main]
-    tags: ["v*"]
-permissions:
-  contents: write
-jobs:
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Unpack project source
-        shell: pwsh
-        run: Expand-Archive -Path Molecula-source.zip -DestinationPath source
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
-      - name: Build and test Windows installer
-        shell: pwsh
-        working-directory: source
-        run: .\scripts\package_windows.ps1
-      - uses: actions/upload-artifact@v4
-        with:
-          name: molecula-windows
-          path: source/dist/windows/Molecula-Windows-Setup.exe
-          if-no-files-found: error
-          retention-days: 30
-      - name: Install and launch app in Windows VM
-        shell: pwsh
-        working-directory: source
-        run: |
-          $installer = (Resolve-Path ".\dist\windows\Molecula-Windows-Setup.exe").Path
-          $setup = Start-Process -FilePath $installer -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-") -Wait -PassThru
-          if ($setup.ExitCode -ne 0) { throw "Installer exited with code $($setup.ExitCode)" }
-          $appPath = Join-Path $env:LOCALAPPDATA "Programs\Molecula\Molecula.exe"
-          if (-not (Test-Path $appPath)) { throw "Installed app not found at $appPath" }
-          $logPath = Join-Path $env:LOCALAPPDATA "Molecula\startup.log"
-          Remove-Item $logPath -ErrorAction SilentlyContinue
-          $app = Start-Process -FilePath $appPath -PassThru
           Start-Sleep -Seconds 8
           $app.Refresh()
           if ($app.HasExited) {
