@@ -21,6 +21,30 @@ jobs:
         shell: pwsh
         working-directory: source
         run: .\scripts\package_windows.ps1
+      - name: Install and launch app in Windows VM
+        shell: pwsh
+        working-directory: source
+        run: |
+          $installer = (Resolve-Path ".\dist\windows\Molecula-Windows-Setup.exe").Path
+          $setup = Start-Process -FilePath $installer -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-") -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Installer exited with code $($setup.ExitCode)" }
+          $appPath = Join-Path $env:LOCALAPPDATA "Programs\Molecula\Molecula.exe"
+          if (-not (Test-Path $appPath)) { throw "Installed app not found at $appPath" }
+          $logPath = Join-Path $env:LOCALAPPDATA "Molecula\startup.log"
+          Remove-Item $logPath -ErrorAction SilentlyContinue
+          $app = Start-Process -FilePath $appPath -PassThru
+          Start-Sleep -Seconds 8
+          $app.Refresh()
+          if ($app.HasExited) {
+            if (Test-Path $logPath) { Get-Content $logPath | Write-Host }
+            throw "Installed app exited during Windows VM smoke test"
+          }
+          if ($app.MainWindowHandle -eq 0) {
+            Stop-Process -Id $app.Id -Force
+            if (Test-Path $logPath) { Get-Content $logPath | Write-Host }
+            throw "Molecula remained running but did not create a main window"
+          }
+          Stop-Process -Id $app.Id -Force
       - uses: actions/upload-artifact@v4
         with:
           name: molecula-windows
@@ -34,6 +58,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the Windows installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --title "Molecula $RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/Molecula-Windows-Setup.exe --clobber
+
         with:
           path: dist
           merge-multiple: true
