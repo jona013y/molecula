@@ -27,9 +27,9 @@
 | Settings/customization | N | Preferences, colors, typography, drawing styles and profiles are not persisted. |
 | Verification | P | 35 Rust tests pass in debug and release, including 20,000-atom analysis, undo/redo history-limit stress, real-file `.mols` save/reopen, MOL import/export and SVG output. Tests also cover graph/format/editor logic, reactions, malformed-file rejection, selection, settings, templates and naming. `cargo clippy --offline --all-targets -- -D warnings` and `cargo fmt --check` pass. The Mac bundle verifier confirms the icon metadata, ICNS asset, `PkgInfo` and arm64 executable. GUI runtime remains unverified here: direct launch panics in miniquad OpenGL pixel-format setup, Launch Services reports `kLSNoExecutableErr`, and launching the bundled executable exits with code 134. Windows VM testing was not repeated. Advanced stereochemistry, calculations and cross-platform behavior remain unverified. |
 
-## 1.0.3 development update
+## 1.0.3 update
 
-Added a searchable command palette for the real menu actions (Cmd/Ctrl+Shift+P), renamed the internal Cargo package and installer executable to `molecula`, and added third-party license notices. This is not a published release yet.
+Added a searchable command palette for the real menu actions (Cmd/Ctrl+Shift+P), renamed the internal Cargo package and installer executable to `molecula`, and added third-party license notices. Both platform installer workflows are defined in GitHub Actions; Windows installation and launch validation passed in the hosted VM.
 
 ## Important limits
 
