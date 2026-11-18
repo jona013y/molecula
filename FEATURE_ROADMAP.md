@@ -72,7 +72,7 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - Add PNG and PDF drawing export and clipboard copy as SVG/image where the platform supports it.
 - [x] Preserve and validate MOL V2000/V3000 singlet, doublet and triplet radical records; round-trip tests cover valid multi-atom records and invalid radical types.
 - [x] Preserve MOL V2000 hydrogen-count overrides (H0–H4), V3000 `HCOUNT` query values (H0–H5), and the exact-count `SUBST`, `UNSAT` and `RBCNT` atom-query fields; warn before export when a format or unsupported value would drop data.
-- [x] Preserve V3000 bond query types 5–8 and ring-only `TOPO=1`; exercise their round trips and ring-aware substructure matching.
+- [x] Preserve V3000 bond query types 5–8 and ring/chain `TOPO=1/2`; exercise their round trips and ring-aware substructure matching.
 - [x] Preserve V3000 wildcard/heteroatom selectors and included/excluded element lists; evaluate them in the local substructure matcher and reject malformed lists.
 - [x] Preserve MOL V2000 parity 3 and V3000 atom CFG=3 as explicitly unspecified/either stereochemistry through round trips.
 - [x] Restore aromatic atom flags from imported type-4 aromatic bonds and avoid MOL/SDF loss warnings for supported atom stereo, wedge/hash/wavy, aromatic bonds, maps, isotopes, charges and radicals; keep warnings for unsupported query/alias/atom extensions.
