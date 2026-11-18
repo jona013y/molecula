@@ -41,7 +41,8 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 ### C. Structure editor and template library — partial
 
 - Add a searchable, categorized template browser with common functional groups, aromatic/heterocyclic rings and amino acids.
-- Add a bond/atom property inspector for isotope, charge, valence override, stereobond display and query-atom settings.
+- [x] Add per-atom valence override editing, persist it in native documents, use it for implicit-H estimates and preserve it in supported MOL V2000/V3000 exports.
+- Continue the bond/atom inspector with stereobond display and query-atom settings.
 - Add fragment alignment/rotation and keyboard-driven bond editing with an explicit preview.
 - Add aromatic/Kekulé conversion only when a chemistry engine can validate the resulting graph.
 - [x] Add formula-checked aromatic pyrrole, furan, thiophene and correctly protonated imidazole templates.
