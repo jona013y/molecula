@@ -66,6 +66,7 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - Add PNG and PDF drawing export and clipboard copy as SVG/image where the platform supports it.
 - [x] Preserve and validate MOL V2000/V3000 singlet, doublet and triplet radical records; round-trip tests cover valid multi-atom records and invalid radical types.
 - [x] Preserve MOL V2000 parity 3 and V3000 atom CFG=3 as explicitly unspecified/either stereochemistry through round trips.
+- [x] Restore aromatic atom flags from imported type-4 aromatic bonds and avoid MOL/SDF loss warnings for supported atom stereo, wedge/hash/wavy, aromatic bonds, maps, isotopes, charges and radicals; keep warnings for unsupported query/alias/atom extensions.
 - Add robust malformed-file messages and round-trip tests for every shipped format.
 
 **Acceptance:** round trips preserve every supported field; unsupported fields are listed before export; no conversion reports success after dropping data silently.
