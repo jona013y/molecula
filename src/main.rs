@@ -4915,11 +4915,18 @@ fn parse_mol_at(s: &str, center: Vec2) -> Result<Molecule, String> {
                     8 => Some("any".to_string()),
                     _ => None,
                 };
+                let mut topology_seen = None;
                 for attr in f.iter().skip(4) {
                     if let Some(value) = attr.strip_prefix("TOPO=") {
                         match value {
-                            "0" => {}
-                            "1" | "2" => {
+                            "0" | "1" | "2" => {
+                                if topology_seen.is_some_and(|seen| seen != value) {
+                                    return Err("Conflicting V3000 TOPO values on one bond".into());
+                                }
+                                topology_seen = Some(value);
+                                if value == "0" {
+                                    continue;
+                                }
                                 let query_term = if value == "1" {
                                     "topology-ring"
                                 } else {
@@ -8004,6 +8011,10 @@ mod tests {
         }
         let invalid = "Q\n  Molecula\n\n  0  0  0     0  0            V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS 2 1 0 0 0\nM  V30 BEGIN ATOM\nM  V30 1 C 0 0 0 0 0\nM  V30 2 C 1 0 0 0 0\nM  V30 END ATOM\nM  V30 BEGIN BOND\nM  V30 1 1 1 2 TOPO=3\nM  V30 END BOND\nM  V30 END CTAB\nM  END\n";
         assert!(parse_mol_at(invalid, vec2(0., 0.)).is_err());
+        let conflicting = invalid.replace("TOPO=3", "TOPO=1 TOPO=2");
+        assert!(parse_mol_at(&conflicting, vec2(0., 0.))
+            .unwrap_err()
+            .contains("Conflicting V3000 TOPO"));
     }
 
     #[test]
