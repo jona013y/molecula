@@ -2443,6 +2443,38 @@ impl Editor {
             atom.aromatic = aromatic_bonds.contains(&atom_index);
         }
     }
+    fn cycle_bond_topology(&mut self, index: usize) {
+        let Some(bond) = self.mol.bonds.get(index) else {
+            return;
+        };
+        let current = bond
+            .query
+            .as_deref()
+            .unwrap_or("")
+            .split(';')
+            .find(|term| matches!(*term, "topology-ring" | "topology-chain"));
+        let next = match current {
+            Some("topology-ring") => Some("topology-chain"),
+            Some("topology-chain") => None,
+            _ => Some("topology-ring"),
+        };
+        let mut terms: Vec<&str> = bond
+            .query
+            .as_deref()
+            .unwrap_or("")
+            .split(';')
+            .filter(|term| !term.is_empty() && !matches!(*term, "topology-ring" | "topology-chain"))
+            .collect();
+        if let Some(next) = next {
+            terms.push(next);
+        }
+        let query = (!terms.is_empty()).then(|| terms.join(";"));
+        if bond.query == query {
+            return;
+        }
+        self.checkpoint();
+        self.mol.bonds[index].query = query;
+    }
     fn cycle_double_bond_stereo(&mut self, index: usize) {
         let Some(bond) = self.mol.bonds.get(index) else {
             return;
@@ -6613,7 +6645,28 @@ async fn main() {
                     muted(),
                 );
             }
-            if button(panel_x + 16., TOP + 258., 210., 33., "Delete bond", false) {
+            let topology_label = match bond
+                .query
+                .as_deref()
+                .unwrap_or("")
+                .split(';')
+                .find(|term| matches!(*term, "topology-ring" | "topology-chain"))
+            {
+                Some("topology-ring") => "Ring only",
+                Some("topology-chain") => "Chain only",
+                _ => "Any topology",
+            };
+            if button(
+                panel_x + 16.,
+                TOP + 252.,
+                210.,
+                31.,
+                &format!("Query topology: {topology_label}  ↻"),
+                false,
+            ) {
+                e.cycle_bond_topology(i);
+            }
+            if button(panel_x + 16., TOP + 293., 210., 33., "Delete bond", false) {
                 e.checkpoint();
                 e.mol.bonds.remove(i);
                 e.selected_bond = None;
@@ -8306,6 +8359,37 @@ mod tests {
         editor.redo();
         assert_eq!(editor.mol.bonds[0].style, BondStyle::Wedge);
         assert_eq!(editor.selected_bond, None);
+    }
+
+    #[test]
+    fn bond_inspector_cycles_query_topology_and_undoes_it() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.add_atom(vec2(40., 0.), "C");
+        editor.add_bond(0, 1, 1);
+        editor.mol.bonds[0].query = Some("single-or-double".into());
+
+        editor.cycle_bond_topology(0);
+        assert_eq!(
+            editor.mol.bonds[0].query.as_deref(),
+            Some("single-or-double;topology-ring")
+        );
+        editor.cycle_bond_topology(0);
+        assert_eq!(
+            editor.mol.bonds[0].query.as_deref(),
+            Some("single-or-double;topology-chain")
+        );
+        editor.undo();
+        assert_eq!(
+            editor.mol.bonds[0].query.as_deref(),
+            Some("single-or-double;topology-ring")
+        );
+        editor.cycle_bond_topology(0);
+        editor.cycle_bond_topology(0);
+        assert_eq!(
+            editor.mol.bonds[0].query.as_deref(),
+            Some("single-or-double")
+        );
     }
 
     #[test]
