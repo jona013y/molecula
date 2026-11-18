@@ -43,7 +43,8 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - Add a searchable, categorized template browser with common functional groups, aromatic/heterocyclic rings and amino acids.
 - [x] Add per-atom valence override editing, persist it in native documents, use it for implicit-H estimates and preserve it in supported MOL V2000/V3000 exports.
 - [x] Add undoable bond order and display-style controls plus a manual E/Z toggle for selected double bonds.
-- Continue the bond/atom inspector with stereobond configuration, geometric stereochemistry validation and query-atom settings.
+- [x] Parse and combine supported atom-query shortcuts (aromaticity, H counts, connectivity, degree, ring data, valence, substitutions and element include/exclude lists), rejecting malformed or contradictory same-field predicates.
+- Still needed: query-atom inspector and actual substructure matching/evaluation, plus stereobond configuration and geometric stereochemistry validation.
 - Add fragment alignment/rotation and keyboard-driven bond editing with an explicit preview.
 - Add aromatic/Kekulé conversion only when a chemistry engine can validate the resulting graph.
 - [x] Add formula-checked aromatic pyrrole, furan, thiophene and correctly protonated imidazole templates.
