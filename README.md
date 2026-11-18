@@ -34,6 +34,8 @@ To install RDKit separately, use a Python environment supported by RDKit and set
 
 ## Repository layout
 
+- `Molecula-source.zip` is the source archive used by the installer workflow. Verify it with `shasum -a 256 -c Molecula-source.zip.sha256` on macOS/Linux or `certutil -hashfile Molecula-source.zip SHA256` on Windows.
+- `Molecula-source.zip.sha256` is the published SHA-256 checksum for the archive.
 - Installer workflows build from the checked-out source on the selected commit, so release builds use the exact published code.
 - `THIRD_PARTY_NOTICES.md` documents dependency and bundled-font license notices.
 - `src/` contains the Rust editor and chemistry model.
