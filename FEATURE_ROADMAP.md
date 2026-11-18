@@ -8,6 +8,7 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - [x] Reaction model: manual component roles, step numbers, coefficients and balance report.
 - [x] Auto-balance single-step reactions when the positive integer solution is unique; include formal charge and reject unresolved/ambiguous cases.
 - [x] Teaching name explanation with supported-scope warnings and highlighted atoms.
+- [x] Extend the bounded teaching namer with carboxylic-acid priority and saturated/unsaturated parent names; test acid numbering and prefixes.
 - [x] Guided naming/reaction balancing lessons with real graph-based feedback.
 - [x] Local graph topology in the properties report; optional RDKit descriptor/candidate-analysis bridge.
 - [x] Document flow: tabs, autosave/recovery, recent files, tab-local undo.
