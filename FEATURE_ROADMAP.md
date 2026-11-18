@@ -71,7 +71,7 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - Add RXN import/export for reaction graphs, with a before-export loss report.
 - Add PNG and PDF drawing export and clipboard copy as SVG/image where the platform supports it.
 - [x] Preserve and validate MOL V2000/V3000 singlet, doublet and triplet radical records; round-trip tests cover valid multi-atom records and invalid radical types.
-- [x] Preserve MOL V2000 hydrogen-count overrides (H0–H4); warn before export when a V3000 path or unsupported value would drop the override.
+- [x] Preserve MOL V2000 hydrogen-count overrides (H0–H4) and V3000 `HCOUNT` query values (H0–H5); warn before export when a format or unsupported value would drop the override.
 - [x] Preserve MOL V2000 parity 3 and V3000 atom CFG=3 as explicitly unspecified/either stereochemistry through round trips.
 - [x] Restore aromatic atom flags from imported type-4 aromatic bonds and avoid MOL/SDF loss warnings for supported atom stereo, wedge/hash/wavy, aromatic bonds, maps, isotopes, charges and radicals; keep warnings for unsupported query/alias/atom extensions.
 - Add robust malformed-file messages and round-trip tests for every shipped format.
