@@ -1,10 +1,12 @@
 # Molecula
 
-Molecula is an independent Rust desktop editor for chemical structures and reaction diagrams. It includes a molecular graph model, 2D editor, reaction arrows, local formula/mass analysis, MOL V2000 import/export, editable `.mols` documents, and SVG export. The feature-by-feature implementation status and limitations are in [STATUS.md](STATUS.md).
+Molecula is an independent Rust desktop editor for chemical structures and reaction diagrams. It includes a molecular graph model, 2D editor, reaction arrows, local formula/mass analysis, MOL V2000 import/export, editable `.mols` documents, SVG export, and a searchable command palette (`Cmd/Ctrl+Shift+P`). The feature-by-feature implementation status and limitations are in [STATUS.md](STATUS.md).
+
+The editor and visual assets are original Molecula work; no MarvinSketch source code, icons, or screenshots are included. Third-party components and their licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is a practical source and dependency review, not legal advice or a trademark clearance opinion.
 
 ## Download and first-run security warnings
 
-Download only from the [official v1.0.2 release](https://github.com/jona013y/molecula/releases/tag/v1.0.2). These expected warnings appear because I chose not to pay for Apple notarization or a Windows publisher signature. They mean the publisher has not been verified; they do not mean the system found malware. I built Molecula for personal use, but only proceed if you trust the official download.
+Download only from the [official releases](https://github.com/jona013y/molecula/releases). Unsigned builds may show publisher-verification warnings because they are not notarized by Apple or signed with a Windows publisher certificate. That warning alone does not establish whether a file is safe; verify that it came from this repository and compare its SHA-256 if a checksum is published.
 
 - **Mac:** Open Molecula once. If the warning appears, click **Done**. Go to **System Settings → Privacy & Security**, scroll down, click **Open Anyway** next to Molecula, then confirm **Open**. Apple describes this one-app exception in its [Gatekeeper instructions](https://support.apple.com/en-us/102445).
 - **Windows:** On **Windows protected your PC**, click **More info → Run anyway**. Microsoft explains why new or unsigned downloads can show this [SmartScreen warning](https://learn.microsoft.com/windows/apps/package-and-deploy/smartscreen-reputation).
@@ -27,6 +29,7 @@ The optional RDKit descriptor bridge requires a separate Python environment with
 ## Repository layout
 
 - `Molecula-source.zip` is the source archive used by the installer workflow.
+- `THIRD_PARTY_NOTICES.md` documents dependency and bundled-font license notices.
 - `src/` contains the Rust editor and chemistry model.
 - `molecula.app/Contents/Resources/Molecula.icns` contains the original Molecula Dock icon.
 - `scripts/verify_macos_bundle.sh` checks app bundle metadata and the icon during packaging.

@@ -1,11 +1,11 @@
-# Feature status — 0.5
+# Feature status — 1.0.3 development
 
 **I** = implemented and tested; **P** = partial; **O** = requires a verified optional integration; **N** = not implemented. A stored property is not treated as a computed or chemically validated property.
 
 | Area | Status | Exact scope |
 |---|---|---|
 | Desktop app and core drawing | I | Native macOS app, canvas, toolbar, central atom/bond graph, selection of one atom/object, move one atom, delete atom/bond/object, preview of bond/arrow, undo/redo. |
-| UI navigation | P | Original navy and green visual design, drawn tool icons, empty-canvas and inspector states, macOS app icon; all top-level menus have working entries. Status line, tooltips and property/analysis panel work. Settings provide English/Danish interface language selection and save the choice in the user's application support folder. No tabs, search, context menus, zoom, dark mode or drawing-style preferences. |
+| UI navigation | P | Original navy and green visual design, drawn tool icons, empty-canvas and inspector states, macOS app icon; all top-level menus have working entries. Status line, tooltips and property/analysis panel work. Settings provide English/Danish interface language selection and save the choice in the user's application support folder. A searchable command palette is available with Cmd/Ctrl+Shift+P; no tabs, context menus, zoom, dark mode or drawing-style preferences. |
 | Chemical model | P | Atom fields include element, optional 3D z, isotope, charge, radical, explicit/override hydrogen, alias, map, aromatic flag, stereo string, R-group and query string. Bond fields include endpoints, order, style, stereo/query strings. Graph and graphic objects are distinct. Advanced stereochemical and query semantics are not validated. |
 | Bonds | P | Single, double, triple, aromatic, filled wedge, hashed wedge, wavy, coordination and any styles can be stored. The toolbar exposes the first seven; coordination is not selectable in the UI. Correct CIP/stereo interpretation is not implemented. |
 | Drawing/selection | P | Place/replace atoms, draw zigzag carbon chains by drag with live preview and endpoint connection, extend bonds, connect existing atoms, merge overlapping ring vertices, 5/6 rings, click-drag box selection of multiple atoms, click selection of individual bonds/graphics, contextual inspector details and undoable deletion of selected atoms/bonds. Drag a single atom to move it. Multi-selection currently selects atoms only and cannot move/rotate a fragment. No sophisticated clean/layout, curved chains or full fragment merging. |
@@ -23,9 +23,13 @@
 | Documents/files | P | New/open/save with `.mols`; MOL V2000 read/write and SVG export. Native roundtrip retains atom/bond metadata and graphics; MOL roundtrip preserves connectivity, charge and isotope in tests. No V3000, SDF, MRV, CDX, RXN, MOL2, CML, PDB, PNG, PDF, clipboard, print, autosave, tabs, recent files or unsaved-change prompt. |
 | Distribution | P | Mac Apple Silicon drag-to-Applications ZIP is built at `dist/Molecula-macOS-arm64.zip`; macOS DMG generation falls back to ZIP where the host disallows disk images. `.github/workflows/release-installers.yml` builds a universal Mac DMG and Windows x64 setup EXE on hosted runners for tagged releases. `installers/windows/Molecula.iss` and `scripts/package_windows.ps1` define the Windows installer. No Windows EXE has been generated in this Mac-only workspace. Neither platform build is Developer ID/Authenticode signed; macOS package is ad-hoc signed and not notarized. |
 | Online services | N/O | Services menu reports integration status; there is no PubChem/Chemicalize/Reaxys/Google Patents API integration or browser search. No API keys are embedded. |
-| Shortcuts | P | Context-safe buffered quick input for bond choices, element symbols, charge, R-group and map numbers; Cmd/Ctrl new/open/save/undo/redo, Delete, Esc and Shift+R. No editable profiles, conflict checker or full Marvin-compatible scheme. |
+| Shortcuts | P | Context-safe buffered quick input for bond choices, element symbols, charge, R-group and map numbers; Cmd/Ctrl new/open/save/undo/redo, Delete, Esc and Shift+R. Cmd/Ctrl+Shift+P opens a searchable command palette backed by the same menu actions. No editable profiles, conflict checker or full Marvin-compatible scheme. |
 | Settings/customization | N | Preferences, colors, typography, drawing styles and profiles are not persisted. |
 | Verification | P | 35 Rust tests pass in debug and release, including 20,000-atom analysis, undo/redo history-limit stress, real-file `.mols` save/reopen, MOL import/export and SVG output. Tests also cover graph/format/editor logic, reactions, malformed-file rejection, selection, settings, templates and naming. `cargo clippy --offline --all-targets -- -D warnings` and `cargo fmt --check` pass. The Mac bundle verifier confirms the icon metadata, ICNS asset, `PkgInfo` and arm64 executable. GUI runtime remains unverified here: direct launch panics in miniquad OpenGL pixel-format setup, Launch Services reports `kLSNoExecutableErr`, and launching the bundled executable exits with code 134. Windows VM testing was not repeated. Advanced stereochemistry, calculations and cross-platform behavior remain unverified. |
+
+## 1.0.3 development update
+
+Added a searchable command palette for the real menu actions (Cmd/Ctrl+Shift+P), renamed the internal Cargo package and installer executable to `molecula`, and added third-party license notices. This is not a published release yet.
 
 ## Important limits
 
