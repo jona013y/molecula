@@ -44,7 +44,8 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - [x] Add per-atom valence override editing, persist it in native documents, use it for implicit-H estimates and preserve it in supported MOL V2000/V3000 exports.
 - [x] Add undoable bond order and display-style controls plus a manual E/Z toggle for selected double bonds.
 - [x] Parse and combine supported atom-query shortcuts (aromaticity, H counts, connectivity, degree, ring data, valence, substitutions and element include/exclude lists), rejecting malformed or contradictory same-field predicates.
-- Still needed: query-atom inspector and actual substructure matching/evaluation, plus stereobond configuration and geometric stereochemistry validation.
+- [x] Add a bounded local substructure matcher for selected connected query fragments against other disconnected target components; evaluate the supported element/list, aromaticity, unsaturation, H-count, degree/connectivity, valence and bond-order subset. Refuse unsupported ring/substitution and stereochemical predicates explicitly.
+- Still needed: query-atom inspector and broader matching (including ring topology and stereochemistry), plus stereobond configuration and geometric stereochemistry validation.
 - Add fragment alignment/rotation and keyboard-driven bond editing with an explicit preview.
 - Add aromatic/Kekulé conversion only when a chemistry engine can validate the resulting graph.
 - [x] Add formula-checked aromatic pyrrole, furan, thiophene and correctly protonated imidazole templates.
