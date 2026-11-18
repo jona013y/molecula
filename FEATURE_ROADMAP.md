@@ -44,6 +44,7 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - Add a bond/atom property inspector for isotope, charge, valence override, stereobond display and query-atom settings.
 - Add fragment alignment/rotation and keyboard-driven bond editing with an explicit preview.
 - Add aromatic/Kekulé conversion only when a chemistry engine can validate the resulting graph.
+- [x] Add formula-checked aromatic pyrrole, furan, thiophene and correctly protonated imidazole templates.
 
 **Acceptance:** template insertion creates chemically connected graph data; invalid chemistry remains editable but is visibly flagged; every edit is undoable.
 
