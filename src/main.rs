@@ -15,6 +15,7 @@ use std::sync::mpsc::{self, Receiver};
 mod acid_base;
 mod chemistry;
 mod cml;
+mod kemi_a;
 mod naming;
 mod native;
 mod pubchem;
@@ -24,6 +25,7 @@ mod reaction;
 mod shortcuts;
 mod smarts;
 mod smiles;
+mod study;
 
 const TOP: f32 = 118.;
 const LEFT: f32 = 88.;
@@ -125,6 +127,42 @@ fn user_templates_path() -> PathBuf {
         .parent()
         .unwrap_or(Path::new("."))
         .join("templates")
+}
+fn chemistry_a_progress_path() -> PathBuf {
+    settings_path()
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("chemistry-a-progress.txt")
+}
+fn load_chemistry_a_progress_from(path: &Path) -> BTreeSet<usize> {
+    fs::read_to_string(path)
+        .ok()
+        .into_iter()
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .filter_map(|line| line.trim().parse::<usize>().ok())
+                .filter(|index| *index < study::CHEMISTRY_A_EXERCISE_COUNT)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+fn load_chemistry_a_progress() -> BTreeSet<usize> {
+    load_chemistry_a_progress_from(&chemistry_a_progress_path())
+}
+fn save_chemistry_a_progress_to(path: &Path, progress: &BTreeSet<usize>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let contents = progress
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, contents)
+}
+fn save_chemistry_a_progress(progress: &BTreeSet<usize>) -> std::io::Result<()> {
+    save_chemistry_a_progress_to(&chemistry_a_progress_path(), progress)
 }
 #[derive(Clone)]
 struct UserTemplate {
@@ -429,6 +467,43 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Formula & mass" => "Formel og masse",
         "Molecular properties" => "Molekyleegenskaber",
         "Chemistry A acid/base tools" => "Kemi A: syre-baseværktøjer",
+        "Chemistry A basic tools" => "Kemi A: stofmængde og pH",
+        "Learning center" => "Læringscenter",
+        "Ask local chemistry helper" => "Spørg den lokale kemiassistent",
+        "Search topics" => "Søg i emner",
+        "Enter a topic or keyword to find a guide." => "Skriv et emne eller søgeord for at finde en vejledning.",
+        "No matching topic" => "Intet emne fundet",
+        "Chemistry A practice" => "Kemi A-øvelser",
+        "Practice Chemistry A" => "Øv Kemi A",
+        "Enter answer" => "Indtast svar",
+        "Hint" => "Tip",
+        "Previous" => "Forrige",
+        "Next" => "Næste",
+        "← Previous" => "← Forrige",
+        "Next →" => "Næste →",
+        "Edit in canvas" => "Redigér på tegnefladen",
+        "End lesson" => "Afslut lektion",
+        "Enter a number. Decimal comma or point is accepted." => "Indtast et tal. Decimal-komma eller punktum accepteres.",
+        "QUESTION" => "OPGAVE",
+        "Progress" => "Fremskridt",
+        "of" => "af",
+        "Local chemistry helper" => "Lokal kemiassistent",
+        "Ask a question" => "Stil et spørgsmål",
+        "Topics" => "Emner",
+        "This helper is offline and uses reviewed answers. It does not guess." => "Hjælperen er offline og bruger gennemgåede svar. Den gætter ikke.",
+        "Ask about buffers, pH, titration, amount of substance, reactions, naming, or the editor." => "Spørg om buffere, pH, titrering, stofmængde, reaktioner, navngivning eller editoren.",
+        "Question" => "Spørgsmål",
+        "Chemistry A calculations" => "Kemi A-beregninger",
+        "Amount of substance from mass" => "Stofmængde fra masse",
+        "Mass from amount of substance" => "Masse fra stofmængde",
+        "Concentration" => "Koncentration",
+        "Dilution" => "Fortynding",
+        "pH from [H₃O⁺]" => "pH fra [H₃O⁺]",
+        "[H₃O⁺] from pH" => "[H₃O⁺] fra pH",
+        "pOH from [OH⁻]" => "pOH fra [OH⁻]",
+        "[OH⁻] from pOH" => "[OH⁻] fra pOH",
+        "pH from pOH" => "pH fra pOH",
+        "pOH from pH" => "pOH fra pH",
         "Chemistry A acid-base workbench" => "Kemi A: syre-baseberegner",
         "Buffer pH from pKa" => "Buffer-pH ud fra pKa",
         "pKa from buffer measurements" => "pKa ud fra buffermåling",
@@ -496,6 +571,7 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Assign R/S labels with RDKit" => "Tildel R/S-labels med RDKit",
         "Integration status" => "Integrationsstatus",
         "Quick start guide" => "Hurtig vejledning",
+        "Enter your question. Example: How do I calculate a buffer pH?" => "Skriv dit spørgsmål. Eksempel: Hvordan beregner jeg pH i en buffer?",
         "Shortcuts" => "Tastaturgenveje",
         "Feature status" => "Funktionsstatus",
         "Settings" => "Indstillinger",
@@ -637,8 +713,6 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Built-in" => "Indbyggede",
         "My templates" => "Mine skabeloner",
         "Save selected fragment" => "Gem markeret fragment",
-        "Previous" => "Forrige",
-        "Next" => "Næste",
         "Confirm delete" => "Bekræft sletning",
         "Name custom template" => "Navngiv skabelon",
         "Rename custom template" => "Omdøb brugerdefineret skabelon",
@@ -686,6 +760,8 @@ fn quick_start_guide(language: Language) -> String {
         "Structure → Name structure gives a name in the supported teaching subset. Molecular properties shows formula and mass.",
         "05  SAVE",
         "File → Save writes a .mols document with editable chemistry and graphics.",
+        "06  LEARN",
+        "Help → Learning center contains worked Chemistry A guides. Ask the local chemistry helper; its answers work offline and stay within reviewed topics.",
         "UNDO Cmd/Ctrl+Z   ·   REDO Cmd/Ctrl+Y   ·   DELETE Delete   ·   CANCEL Esc",
     ]
     .into_iter()
@@ -695,6 +771,7 @@ fn quick_start_guide(language: Language) -> String {
 }
 fn localized_dynamic(source: &str) -> Cow<'_, str> {
     for (prefix, replacement) in [
+        ("Progress:", "Fremskridt:"),
         ("Charge:", "Ladning:"),
         ("Isotope:", "Isotop:"),
         ("Map:", "Atomkort:"),
@@ -1377,42 +1454,85 @@ enum TextTarget {
     BjerrumDiagram,
     PolyproticTitrationPh,
     PolyproticTitrationCurve,
+    BasicCalculation(kemi_a::BasicCalculation),
+    TutorQuestion,
+    ChemistryAAnswer(usize),
+    StudySearch,
 }
-fn acid_base_prompt(target: TextTarget) -> Option<&'static str> {
+fn acid_base_prompt(target: TextTarget, language: Language) -> Option<String> {
+    if let TextTarget::BasicCalculation(calculation) = target {
+        return Some(calculation.prompt(language == Language::Danish).into());
+    }
     match target {
-        TextTarget::BufferPh => Some("Buffer pH (pKa; acid M; conjugate base M)"),
-        TextTarget::PkaFromBuffer => Some("Measured pH; acid M; conjugate base M"),
-        TextTarget::WeakAcidPh => Some("pKa; weak-acid concentration M"),
-        TextTarget::WeakBasePh => Some("pKa of conjugate acid; total base concentration M"),
+        TextTarget::BufferPh => Some("Buffer pH (pKa; acid M; conjugate base M)".into()),
+        TextTarget::PkaFromBuffer => Some("Measured pH; acid M; conjugate base M".into()),
+        TextTarget::WeakAcidPh => Some("pKa; weak-acid concentration M".into()),
+        TextTarget::WeakBasePh => Some("pKa of conjugate acid; total base concentration M".into()),
         TextTarget::StrongMixturePh => {
-            Some("Final strong-acid concentration M; final strong-base concentration M")
+            Some("Final strong-acid concentration M; final strong-base concentration M".into())
         }
         TextTarget::PolyproticSpeciation => {
-            Some("pKa values (in increasing order) separated by |; then pH")
+            Some("pKa values (in increasing order) separated by |; then pH".into())
         }
-        TextTarget::BjerrumDiagram => Some("pKa values separated by |; pH minimum; maximum; step"),
-        TextTarget::PolyproticTitrationPh => {
-            Some("pKa values separated by |; acid volume mL; acid M; base M; added base volume mL")
+        TextTarget::BjerrumDiagram => {
+            Some("pKa values separated by |; pH minimum; maximum; step".into())
         }
-        TextTarget::PolyproticTitrationCurve => {
-            Some("pKa values separated by |; acid volume mL; acid M; base M; max equivalents")
-        }
+        TextTarget::PolyproticTitrationPh => Some(
+            "pKa values separated by |; acid volume mL; acid M; base M; added base volume mL"
+                .into(),
+        ),
+        TextTarget::PolyproticTitrationCurve => Some(
+            "pKa values separated by |; acid volume mL; acid M; base M; max equivalents".into(),
+        ),
         _ => None,
     }
 }
-fn acid_base_example(target: TextTarget) -> Option<&'static str> {
+fn acid_base_example(target: TextTarget, language: Language) -> Option<String> {
+    if let TextTarget::BasicCalculation(calculation) = target {
+        return Some(calculation.example(language == Language::Danish).into());
+    }
     match target {
-        TextTarget::BufferPh => Some("Example: 4.76; 0.10; 0.20"),
-        TextTarget::PkaFromBuffer => Some("Example: 5.06; 0.10; 0.20"),
-        TextTarget::WeakAcidPh => Some("Example: 4.76; 0.10"),
-        TextTarget::WeakBasePh => Some("Example: 9.25; 0.10"),
-        TextTarget::StrongMixturePh => Some("Example: 0.10; 0.05"),
-        TextTarget::PolyproticSpeciation => Some("Example: 2.15|7.20|12.35; 7.00"),
-        TextTarget::BjerrumDiagram => Some("Example: 2.15|7.20; 0; 14; 0.5"),
-        TextTarget::PolyproticTitrationPh => Some("Example: 4.76; 25; 0.10; 0.10; 12.5"),
-        TextTarget::PolyproticTitrationCurve => Some("Example: 4.76; 25; 0.10; 0.10; 1.5"),
+        TextTarget::BufferPh => Some("Example: 4.76; 0.10; 0.20".into()),
+        TextTarget::PkaFromBuffer => Some("Example: 5.06; 0.10; 0.20".into()),
+        TextTarget::WeakAcidPh => Some("Example: 4.76; 0.10".into()),
+        TextTarget::WeakBasePh => Some("Example: 9.25; 0.10".into()),
+        TextTarget::StrongMixturePh => Some("Example: 0.10; 0.05".into()),
+        TextTarget::PolyproticSpeciation => Some("Example: 2.15|7.20|12.35; 7.00".into()),
+        TextTarget::BjerrumDiagram => Some("Example: 2.15|7.20; 0; 14; 0.5".into()),
+        TextTarget::PolyproticTitrationPh => Some("Example: 4.76; 25; 0.10; 0.10; 12.5".into()),
+        TextTarget::PolyproticTitrationCurve => Some("Example: 4.76; 25; 0.10; 0.10; 1.5".into()),
         _ => None,
     }
+}
+fn localize_kemi_a_error(error: &str, danish: bool) -> String {
+    if !danish {
+        return error.to_string();
+    }
+    for (prefix, translated) in [
+        ("Invalid number:", "Ugyldigt tal:"),
+        ("Enter exactly ", "Indtast præcis "),
+        (
+            " value(s), separated by semicolons",
+            " værdi(er), adskilt af semikolon",
+        ),
+        (
+            "Values must be finite numbers",
+            "Værdier skal være endelige tal",
+        ),
+        ("must be greater than zero", "skal være større end nul"),
+        ("cannot be negative", "må ikke være negativ"),
+        (
+            "Final volume cannot be smaller than the transferred volume",
+            "Slutvolumen kan ikke være mindre end det overførte volumen",
+        ),
+        ("pH must be between", "pH skal være mellem"),
+        ("pOH must be between", "pOH skal være mellem"),
+    ] {
+        if let Some(rest) = error.strip_prefix(prefix) {
+            return format!("{translated}{rest}");
+        }
+    }
+    error.to_string()
 }
 fn localize_acid_base_report(language: Language, report: String) -> String {
     if language != Language::Danish {
@@ -1628,8 +1748,17 @@ fn copy_png_to_clipboard(png: &[u8]) -> Result<(), String> {
     Err("Image clipboard is unavailable on this platform".into())
 }
 enum LessonContent {
-    Naming { name: String, steps: Vec<String> },
-    Reaction { feedback: Option<String> },
+    Naming {
+        name: String,
+        steps: Vec<String>,
+    },
+    Reaction {
+        feedback: Option<String>,
+    },
+    ChemistryA {
+        feedback: Option<(bool, String)>,
+        hint_level: u8,
+    },
 }
 struct TeachingLesson {
     content: LessonContent,
@@ -1724,6 +1853,12 @@ struct Editor {
     palette_query: String,
     palette_selection: usize,
     info_overlay: Option<String>,
+    learning_open: bool,
+    study_topic: study::Topic,
+    study_query: String,
+    tutor_question: String,
+    tutor_reply: Option<study::Reply>,
+    chemistry_a_progress: BTreeSet<usize>,
     acid_base_open: bool,
     acid_base_chart: Option<ChemistryChart>,
     info_scroll: usize,
@@ -1904,6 +2039,12 @@ impl Editor {
             palette_query: String::new(),
             palette_selection: 0,
             info_overlay: None,
+            learning_open: false,
+            study_topic: study::Topic::GettingStarted,
+            study_query: String::new(),
+            tutor_question: String::new(),
+            tutor_reply: None,
+            chemistry_a_progress: load_chemistry_a_progress(),
             acid_base_open: false,
             acid_base_chart: None,
             info_scroll: 0,
@@ -2801,6 +2942,48 @@ impl Editor {
             step: 0,
         });
         self.lesson_open = true;
+    }
+    fn start_chemistry_a_lesson(&mut self) {
+        let step = (0..study::CHEMISTRY_A_EXERCISE_COUNT)
+            .find(|index| !self.chemistry_a_progress.contains(index))
+            .unwrap_or(0);
+        self.lesson = Some(TeachingLesson {
+            content: LessonContent::ChemistryA {
+                feedback: None,
+                hint_level: 0,
+            },
+            step,
+        });
+        self.lesson_open = true;
+        self.learning_open = false;
+    }
+    fn check_chemistry_a_answer(&mut self, exercise: usize, input: &str) {
+        let Some((correct, feedback)) =
+            study::check_exercise(exercise, input, self.language == Language::Danish)
+        else {
+            self.info_overlay = Some("This Chemistry A exercise is unavailable.".into());
+            return;
+        };
+        if correct {
+            self.chemistry_a_progress.insert(exercise);
+            if let Err(error) = save_chemistry_a_progress(&self.chemistry_a_progress) {
+                self.status = format!("Exercise solved, but progress could not be saved: {error}");
+            }
+        }
+        if let Some(TeachingLesson {
+            content:
+                LessonContent::ChemistryA {
+                    feedback: current_feedback,
+                    ..
+                },
+            step,
+        }) = self.lesson.as_mut()
+        {
+            if *step == exercise {
+                *current_feedback = Some((correct, feedback));
+                self.lesson_open = true;
+            }
+        }
     }
     fn start_rdkit_graph_operation(&mut self, operation: &'static str) {
         if self.refuse_overlapping_worker() {
@@ -5301,6 +5484,58 @@ impl Editor {
                     self.text_buffer.clear();
                     return;
                 }
+                TextTarget::BasicCalculation(calculation) => {
+                    let input = self.text_buffer.clone();
+                    let danish = self.language == Language::Danish;
+                    self.info_overlay = Some(
+                        kemi_a::calculate(calculation, &input, danish)
+                            .unwrap_or_else(|error| localize_kemi_a_error(&error, danish)),
+                    );
+                    self.info_scroll = 0;
+                    self.text_buffer.clear();
+                    return;
+                }
+                TextTarget::TutorQuestion => {
+                    self.tutor_question = self.text_buffer.trim().to_string();
+                    let reply =
+                        study::answer(&self.tutor_question, self.language == Language::Danish);
+                    self.study_topic = reply.topic.unwrap_or(study::Topic::GettingStarted);
+                    self.tutor_reply = Some(reply);
+                    self.learning_open = true;
+                    self.text_buffer.clear();
+                    return;
+                }
+                TextTarget::StudySearch => {
+                    self.study_query = self.text_buffer.trim().to_string();
+                    let query = self.study_query.clone();
+                    if let Some(topic) =
+                        study::search_topic(&query, self.language == Language::Danish)
+                    {
+                        self.study_topic = topic;
+                        self.tutor_reply = None;
+                        self.tutor_question.clear();
+                    } else {
+                        self.tutor_question = query.clone();
+                        self.tutor_reply = Some(study::Reply {
+                            topic: None,
+                            title: localized(self.language, "No matching topic").into_owned(),
+                            body: if self.language == Language::Danish {
+                                "Prøv et andet søgeord, for eksempel pH, buffer, titrering eller stofmængde."
+                            } else {
+                                "Try another keyword, such as pH, buffer, titration, or amount of substance."
+                            }.into(),
+                        });
+                    }
+                    self.learning_open = true;
+                    self.text_buffer.clear();
+                    return;
+                }
+                TextTarget::ChemistryAAnswer(exercise) => {
+                    let input = self.text_buffer.clone();
+                    self.check_chemistry_a_answer(exercise, &input);
+                    self.text_buffer.clear();
+                    return;
+                }
                 _ => {}
             }
             self.checkpoint();
@@ -5334,7 +5569,11 @@ impl Editor {
                 | TextTarget::PolyproticSpeciation
                 | TextTarget::BjerrumDiagram
                 | TextTarget::PolyproticTitrationPh
-                | TextTarget::PolyproticTitrationCurve => unreachable!(),
+                | TextTarget::PolyproticTitrationCurve
+                | TextTarget::BasicCalculation(_)
+                | TextTarget::TutorQuestion
+                | TextTarget::StudySearch
+                | TextTarget::ChemistryAAnswer(_) => unreachable!(),
             }
             self.text_buffer.clear();
         }
@@ -6021,6 +6260,19 @@ impl Editor {
         "Reaction coefficient: 3"=>self.set_reaction_component(None,None,Some(3)),
         "Reaction coefficient: custom"=>{self.text_buffer.clear();self.text_target=Some(TextTarget::ReactionCoefficient);},
         "Chemistry A acid/base tools"=>self.acid_base_open=true,
+        "Chemistry A calculations"=>self.acid_base_open=true,
+        "Chemistry A basic tools"=>self.acid_base_open=true,
+        "Learning center"=>{
+            self.learning_open=true;
+            self.study_topic=study::Topic::GettingStarted;
+            self.tutor_reply=None;
+        },
+        "Ask local chemistry helper"=>{
+            self.learning_open=false;
+            self.text_buffer.clear();
+            self.text_target=Some(TextTarget::TutorQuestion);
+        },
+        "Chemistry A practice"=>self.start_chemistry_a_lesson(),
         "Reaction step: 1"=>self.set_reaction_component(None,Some(1),None),
         "Reaction step: 2"=>self.set_reaction_component(None,Some(2),None),
         "Reaction step: 3"=>self.set_reaction_component(None,Some(3),None),
@@ -8390,7 +8642,7 @@ fn menu_items(i: usize) -> &'static [&'static str] {
             "Formula & mass",
             "Molecular properties",
             "Local topological descriptors",
-            "Chemistry A acid/base tools",
+            "Chemistry A calculations",
             "Reaction analysis",
             "Auto-balance reaction",
             "Auto-balance all reaction steps",
@@ -8422,6 +8674,9 @@ fn menu_items(i: usize) -> &'static [&'static str] {
         ],
         9 => &[
             "Quick start guide",
+            "Learning center",
+            "Ask local chemistry helper",
+            "Chemistry A practice",
             "Naming lesson",
             "Reaction balancing lesson",
             "Resume lesson",
@@ -8456,6 +8711,32 @@ fn wrap_info_lines(text: &str, width: usize) -> Vec<String> {
         }
     }
     wrapped
+}
+
+fn wrap_study_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut output = Vec::new();
+    for paragraph in text.lines() {
+        if paragraph.trim().is_empty() {
+            output.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let extra = usize::from(!line.is_empty()) + word.chars().count();
+            if !line.is_empty() && line.chars().count() + extra > width {
+                output.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            output.push(line);
+        }
+    }
+    output
 }
 
 fn background_calculation_error(message: &str) -> (String, String) {
@@ -8779,6 +9060,149 @@ async fn main() {
             next_frame().await;
             continue;
         }
+        if e.learning_open {
+            clear_background(surface());
+            let w = screen_width();
+            let h = screen_height();
+            let width = w.clamp(760., 1120.);
+            let height = h.clamp(560., 760.);
+            let x = (w - width) / 2.;
+            let y = (h - height) / 2.;
+            round_rect(
+                x + 4.,
+                y + 6.,
+                width,
+                height,
+                18.,
+                Color::from_rgba(0, 0, 0, 34),
+            );
+            round_rect(x, y, width, height, 18., card_surface());
+            round_rect(x, y, width, 72., 18., Color::from_rgba(232, 245, 236, 255));
+            draw_rectangle(x, y + 54., width, 18., Color::from_rgba(232, 245, 236, 255));
+            draw_text("Learning center", x + 24., y + 34., 24., ink());
+            draw_text(
+                "This helper is offline and uses reviewed answers. It does not guess.",
+                x + 24.,
+                y + 56.,
+                13.,
+                muted(),
+            );
+            let left = x + 22.;
+            let top = y + 96.;
+            draw_text("Topics", left, top, 13., muted());
+            draw_text(
+                &format!(
+                    "Progress: {}/{}",
+                    e.chemistry_a_progress.len(),
+                    study::CHEMISTRY_A_EXERCISE_COUNT
+                ),
+                left + 138.,
+                top,
+                13.,
+                accent(),
+            );
+            let mut picked = None;
+            for (index, topic) in study::Topic::ALL.iter().copied().enumerate() {
+                if button(
+                    left,
+                    top + 16. + index as f32 * 43.,
+                    270.,
+                    36.,
+                    topic.title(e.language == Language::Danish),
+                    topic == e.study_topic && e.tutor_reply.is_none(),
+                ) {
+                    picked = Some(topic);
+                }
+            }
+            let content_x = x + 320.;
+            let content_width = width - 350.;
+            if let Some(reply) = &e.tutor_reply {
+                draw_text(
+                    &localized(e.language, "Local chemistry helper"),
+                    content_x,
+                    top + 5.,
+                    13.,
+                    accent(),
+                );
+                draw_text(&reply.title, content_x, top + 39., 23., ink());
+                draw_text("Question", content_x, top + 69., 12., muted());
+                let question = wrap_study_text(&e.tutor_question, 76);
+                for (i, line) in question.iter().take(2).enumerate() {
+                    draw_text(line, content_x, top + 93. + i as f32 * 19., 14., muted());
+                }
+                draw_rectangle(content_x, top + 135., content_width, 1., panel_surface());
+                let body = wrap_study_text(&reply.body, 76);
+                for (i, line) in body.iter().take(19).enumerate() {
+                    draw_text(line, content_x, top + 162. + i as f32 * 23., 16., ink());
+                }
+            } else {
+                draw_text(
+                    e.study_topic.title(e.language == Language::Danish),
+                    content_x,
+                    top + 8.,
+                    23.,
+                    ink(),
+                );
+                let body =
+                    wrap_study_text(e.study_topic.article(e.language == Language::Danish), 76);
+                for (i, line) in body.iter().take(23).enumerate() {
+                    draw_text(line, content_x, top + 52. + i as f32 * 23., 16., ink());
+                }
+                draw_text(
+                    "Ask about buffers, pH, titration, amount of substance, reactions, naming, or the editor.",
+                    content_x,
+                    y + height - 88.,
+                    13.,
+                    muted(),
+                );
+            }
+            if let Some(topic) = picked {
+                e.study_topic = topic;
+                e.tutor_reply = None;
+                e.tutor_question.clear();
+            }
+            if button(
+                x + width - 650.,
+                y + height - 58.,
+                138.,
+                38.,
+                "Search topics",
+                false,
+            ) {
+                e.learning_open = false;
+                e.text_buffer = e.study_query.clone();
+                e.text_target = Some(TextTarget::StudySearch);
+            }
+            if button(
+                x + width - 500.,
+                y + height - 58.,
+                170.,
+                38.,
+                "Practice Chemistry A",
+                false,
+            ) {
+                e.start_chemistry_a_lesson();
+            }
+            if button(
+                x + width - 316.,
+                y + height - 58.,
+                186.,
+                38.,
+                "Ask a question",
+                true,
+            ) {
+                e.learning_open = false;
+                e.text_buffer.clear();
+                e.text_target = Some(TextTarget::TutorQuestion);
+            }
+            if button(x + width - 112., y + height - 58., 90., 38., "Close", false)
+                || is_key_pressed(KeyCode::Escape)
+            {
+                e.learning_open = false;
+            }
+            next_frame().await;
+            continue;
+        }
         if e.lesson_open {
             clear_background(surface());
             let w = screen_width();
@@ -8798,6 +9222,7 @@ async fn main() {
             let title = match e.lesson.as_ref().map(|l| &l.content) {
                 Some(LessonContent::Naming { .. }) => "NAMING · GUIDED PRACTICE",
                 Some(LessonContent::Reaction { .. }) => "REACTION · BALANCE PRACTICE",
+                Some(LessonContent::ChemistryA { .. }) => "CHEMISTRY A · PRACTICE",
                 None => "TEACHING",
             };
             draw_text(title, x + 26., y + 34., 20., WHITE);
@@ -8889,12 +9314,87 @@ async fn main() {
                             action = Some("check");
                         }
                     }
+                    LessonContent::ChemistryA {
+                        feedback,
+                        hint_level,
+                    } => {
+                        let exercise_index = lesson
+                            .step
+                            .min(study::CHEMISTRY_A_EXERCISE_COUNT.saturating_sub(1));
+                        let exercise =
+                            study::exercise(exercise_index, e.language == Language::Danish)
+                                .expect("bounded Chemistry A exercise index");
+                        let question_label = if e.language == Language::Danish {
+                            format!(
+                                "OPGAVE {} AF {} · {}",
+                                exercise_index + 1,
+                                study::CHEMISTRY_A_EXERCISE_COUNT,
+                                exercise.title
+                            )
+                        } else {
+                            format!(
+                                "QUESTION {} OF {} · {}",
+                                exercise_index + 1,
+                                study::CHEMISTRY_A_EXERCISE_COUNT,
+                                exercise.title
+                            )
+                        };
+                        draw_text(&question_label, x + 28., y + 114., 13., accent());
+                        for (i, line) in wrap_study_text(exercise.prompt, 76)
+                            .iter()
+                            .take(4)
+                            .enumerate()
+                        {
+                            draw_text(line, x + 28., y + 153. + i as f32 * 23., 17., ink());
+                        }
+                        if *hint_level > 0 {
+                            let hint = study::exercise_hint(
+                                exercise_index,
+                                *hint_level,
+                                e.language == Language::Danish,
+                            )
+                            .unwrap_or("");
+                            draw_text("Hint", x + 28., y + 258., 13., accent());
+                            for (i, line) in wrap_study_text(hint, 82).iter().take(2).enumerate() {
+                                draw_text(line, x + 28., y + 280. + i as f32 * 20., 15., muted());
+                            }
+                        }
+                        if let Some((correct, message)) = feedback {
+                            draw_rectangle(x + 25., y + 324., 710., 86., panel_surface());
+                            let feedback_lines = wrap_study_text(message, 88);
+                            for (i, line) in feedback_lines.iter().take(3).enumerate() {
+                                draw_text(
+                                    line,
+                                    x + 38.,
+                                    y + 348. + i as f32 * 19.,
+                                    13.,
+                                    if *correct { accent() } else { ink() },
+                                );
+                            }
+                        }
+                        if exercise_index > 0
+                            && button(x + 25., y + 430., 92., 42., "← Previous", false)
+                        {
+                            action = Some("previous");
+                        }
+                        if exercise_index + 1 < study::CHEMISTRY_A_EXERCISE_COUNT
+                            && button(x + 124., y + 430., 92., 42., "Next →", true)
+                        {
+                            action = Some("next");
+                        }
+                        if *hint_level < 2 && button(x + 224., y + 430., 88., 42., "Hint", false) {
+                            action = Some("hint");
+                        }
+                        if button(x + 320., y + 430., 130., 42., "Enter answer", true) {
+                            action = Some("answer");
+                        }
+                    }
                 }
             }
-            if button(x + 420., y + 430., 155., 42., "Edit in canvas", false) {
+            if button(x + 490., y + 430., 112., 42., "Edit in canvas", false) {
                 action = Some("edit");
             }
-            if button(x + 590., y + 430., 140., 42., "End lesson", false) {
+            if button(x + 615., y + 430., 112., 42., "End lesson", false) {
                 action = Some("end");
             }
             if is_key_pressed(KeyCode::Escape) {
@@ -8903,15 +9403,50 @@ async fn main() {
             match action {
                 Some("previous") => {
                     if let Some(l) = &mut e.lesson {
-                        l.step = l.step.saturating_sub(1)
+                        l.step = l.step.saturating_sub(1);
+                        if let LessonContent::ChemistryA {
+                            feedback,
+                            hint_level,
+                        } = &mut l.content
+                        {
+                            *feedback = None;
+                            *hint_level = 0;
+                        }
                     }
                 }
                 Some("next") => {
                     if let Some(l) = &mut e.lesson {
-                        l.step += 1
+                        if matches!(&l.content, LessonContent::ChemistryA { .. }) {
+                            l.step = (l.step + 1).min(study::CHEMISTRY_A_EXERCISE_COUNT - 1);
+                        } else {
+                            l.step += 1;
+                        }
+                        if let LessonContent::ChemistryA {
+                            feedback,
+                            hint_level,
+                        } = &mut l.content
+                        {
+                            *feedback = None;
+                            *hint_level = 0;
+                        }
                     }
                 }
                 Some("check") => e.check_reaction_lesson(),
+                Some("hint") => {
+                    if let Some(TeachingLesson {
+                        content: LessonContent::ChemistryA { hint_level, .. },
+                        ..
+                    }) = &mut e.lesson
+                    {
+                        *hint_level = hint_level.saturating_add(1).min(2);
+                    }
+                }
+                Some("answer") => {
+                    let step = e.lesson.as_ref().map(|lesson| lesson.step).unwrap_or(0);
+                    e.lesson_open = false;
+                    e.text_buffer.clear();
+                    e.text_target = Some(TextTarget::ChemistryAAnswer(step));
+                }
                 Some("edit") => e.lesson_open = false,
                 Some("end") => {
                     e.lesson = None;
@@ -10591,8 +11126,8 @@ async fn main() {
             }
         } else if e.acid_base_open {
             draw_rectangle(0., 0., w, h, Color::from_rgba(0, 0, 0, 120));
-            let width = 680.;
-            let height = 540.;
+            let width = 1010.;
+            let height = 620.;
             let x = (w - width) / 2.;
             let y = (h - height) / 2.;
             round_rect(
@@ -10607,44 +11142,72 @@ async fn main() {
             round_rect(x, y, width, 58., 18., Color::from_rgba(232, 245, 236, 255));
             draw_rectangle(x, y + 40., width, 18., Color::from_rgba(232, 245, 236, 255));
             draw_text(
-                &localized(e.language, "Chemistry A acid-base workbench"),
+                &localized(e.language, "Chemistry A calculations"),
                 x + 22.,
                 y + 36.,
                 24.,
                 ink(),
             );
-            let tools = [
-                TextTarget::BufferPh,
-                TextTarget::PkaFromBuffer,
-                TextTarget::WeakAcidPh,
-                TextTarget::WeakBasePh,
-                TextTarget::StrongMixturePh,
-                TextTarget::PolyproticSpeciation,
-                TextTarget::BjerrumDiagram,
-                TextTarget::PolyproticTitrationPh,
-                TextTarget::PolyproticTitrationCurve,
+            let mut tools = vec![
+                (
+                    TextTarget::BufferPh,
+                    localized(e.language, "Buffer pH from pKa").into_owned(),
+                ),
+                (
+                    TextTarget::PkaFromBuffer,
+                    localized(e.language, "pKa from buffer measurements").into_owned(),
+                ),
+                (
+                    TextTarget::WeakAcidPh,
+                    localized(e.language, "Weak-acid pH").into_owned(),
+                ),
+                (
+                    TextTarget::WeakBasePh,
+                    localized(e.language, "Weak-base pH").into_owned(),
+                ),
+                (
+                    TextTarget::StrongMixturePh,
+                    localized(e.language, "Strong acid/base mixture pH").into_owned(),
+                ),
+                (
+                    TextTarget::PolyproticSpeciation,
+                    localized(e.language, "Polyprotic speciation").into_owned(),
+                ),
+                (
+                    TextTarget::BjerrumDiagram,
+                    localized(e.language, "Bjerrum diagram data").into_owned(),
+                ),
+                (
+                    TextTarget::PolyproticTitrationPh,
+                    localized(e.language, "Polyprotic titration pH").into_owned(),
+                ),
+                (
+                    TextTarget::PolyproticTitrationCurve,
+                    localized(e.language, "Polyprotic titration curve").into_owned(),
+                ),
             ];
-            let labels = [
-                "Buffer pH from pKa",
-                "pKa from buffer measurements",
-                "Weak-acid pH",
-                "Weak-base pH",
-                "Strong acid/base mixture pH",
-                "Polyprotic speciation",
-                "Bjerrum diagram data",
-                "Polyprotic titration pH",
-                "Polyprotic titration curve",
-            ];
+            tools.extend(
+                kemi_a::BasicCalculation::ALL
+                    .into_iter()
+                    .map(|calculation| {
+                        (
+                            TextTarget::BasicCalculation(calculation),
+                            calculation
+                                .title(e.language == Language::Danish)
+                                .to_string(),
+                        )
+                    }),
+            );
             UI_INPUT_ENABLED.with(|enabled| enabled.set(true));
-            for (index, (target, label)) in tools.iter().zip(labels).enumerate() {
-                let column = index / 5;
-                let row = index % 5;
+            for (index, (target, label)) in tools.iter().enumerate() {
+                let column = index / 7;
+                let row = index % 7;
                 if button(
-                    x + 22. + column as f32 * 326.,
-                    y + 74. + row as f32 * 49.,
-                    310.,
-                    41.,
-                    &localized(e.language, label),
+                    x + 22. + column as f32 * 330.,
+                    y + 72. + row as f32 * 42.,
+                    316.,
+                    36.,
+                    label,
                     false,
                 ) {
                     e.start_acid_base_input(*target);
@@ -10653,28 +11216,28 @@ async fn main() {
             draw_text(
                 &localized(e.language, "pKa is entered from your class data or a cited table. No structure-based pKa prediction is made."),
                 x + 24.,
-                y + 355.,
+                y + 382.,
                 13.,
                 muted(),
             );
             draw_text(
                 "Aqueous ideal-solution model · 25 °C · Kw = 1.0×10⁻¹⁴ · concentrations in mol/L",
                 x + 24.,
-                y + 381.,
+                y + 404.,
                 13.,
                 muted(),
             );
             draw_text(
                 &localized(e.language, "Choose a calculation, then enter values in the order shown. Use ; between fields and | between successive pKa values."),
                 x + 24.,
-                y + 407.,
+                y + 427.,
                 12.,
                 muted(),
             );
             draw_text(
                 &localized(e.language, "Henderson–Hasselbalch: pH = pKa + log₁₀([A⁻]/[HA]). Charts can copy data as CSV."),
                 x + 24.,
-                y + 429.,
+                y + 449.,
                 12.,
                 muted(),
             );
@@ -10993,10 +11556,24 @@ async fn main() {
         } else if e.text_target.is_some() {
             draw_rectangle(0., 0., w, h, Color::from_rgba(0, 0, 0, 100));
             let text_target = e.text_target.unwrap();
-            let acid_base_prompt_text = acid_base_prompt(text_target);
+            let acid_base_prompt_text = acid_base_prompt(text_target, e.language);
             let acid_base_input = acid_base_prompt_text.is_some();
-            let width = if acid_base_input { 650. } else { 500. };
-            let height = if acid_base_input { 250. } else { 195. };
+            let tutor_question = matches!(text_target, TextTarget::TutorQuestion);
+            let study_search = matches!(text_target, TextTarget::StudySearch);
+            let chemistry_a_answer = matches!(text_target, TextTarget::ChemistryAAnswer(_));
+            let width = if acid_base_input {
+                650.
+            } else if tutor_question || study_search || chemistry_a_answer {
+                620.
+            } else {
+                500.
+            };
+            let height = if acid_base_input || tutor_question || study_search || chemistry_a_answer
+            {
+                250.
+            } else {
+                195.
+            };
             let dx = (w - width) / 2.;
             let template_name = matches!(e.text_target, Some(TextTarget::TemplateName));
             let template_rename = matches!(e.text_target, Some(TextTarget::RenameUserTemplate(_)));
@@ -11012,6 +11589,12 @@ async fn main() {
                 localized(e.language, "Edit molecule data").into_owned()
             } else if reaction_coefficient {
                 localized(e.language, "Reaction coefficient: custom").into_owned()
+            } else if tutor_question {
+                localized(e.language, "Ask local chemistry helper").into_owned()
+            } else if study_search {
+                localized(e.language, "Search topics").into_owned()
+            } else if chemistry_a_answer {
+                localized(e.language, "Enter answer").into_owned()
             } else if template_name {
                 "Name custom template".into()
             } else if template_rename {
@@ -11022,8 +11605,16 @@ async fn main() {
             draw_text(&dialog_title, dx + 20., dy + 35., 24., DARKGRAY);
             draw_rectangle_lines(dx + 20., dy + 55., width - 40., 39., 1., accent());
             draw_text(&e.text_buffer, dx + 27., dy + 81., 20., DARKGRAY);
-            if acid_base_input {
-                let prompt = localized(e.language, acid_base_prompt_text.unwrap());
+            if study_search {
+                draw_text(
+                    &localized(e.language, "Enter a topic or keyword to find a guide."),
+                    dx + 21.,
+                    dy + 116.,
+                    14.,
+                    muted(),
+                );
+            } else if acid_base_input {
+                let prompt = localized(e.language, acid_base_prompt_text.as_deref().unwrap_or(""));
                 draw_text(&prompt, dx + 21., dy + 116., 14., muted());
                 draw_text(
                     &localized(
@@ -11036,11 +11627,38 @@ async fn main() {
                     muted(),
                 );
                 draw_text(
-                    &localized(e.language, acid_base_example(text_target).unwrap_or("")),
+                    &localized(
+                        e.language,
+                        acid_base_example(text_target, e.language)
+                            .as_deref()
+                            .unwrap_or(""),
+                    ),
                     dx + 21.,
                     dy + 165.,
                     13.,
                     accent(),
+                );
+            } else if tutor_question {
+                draw_text(
+                    &localized(
+                        e.language,
+                        "Enter your question. Example: How do I calculate a buffer pH?",
+                    ),
+                    dx + 21.,
+                    dy + 122.,
+                    14.,
+                    muted(),
+                );
+            } else if chemistry_a_answer {
+                draw_text(
+                    &localized(
+                        e.language,
+                        "Enter a number. Decimal comma or point is accepted.",
+                    ),
+                    dx + 21.,
+                    dy + 122.,
+                    14.,
+                    muted(),
                 );
             } else if template_edit {
                 draw_text(
@@ -11673,6 +12291,105 @@ mod tests {
         assert!(editor.info_overlay.as_deref().is_some_and(|report| {
             report.contains("calculation unavailable") && report.contains("positive number")
         }));
+    }
+
+    #[test]
+    fn general_chemistry_a_tools_route_through_the_real_input_dialog() {
+        let mut editor = Editor::new();
+        editor.menu_action("Chemistry A calculations");
+        assert!(editor.acid_base_open);
+        editor.start_acid_base_input(TextTarget::BasicCalculation(
+            kemi_a::BasicCalculation::Dilution,
+        ));
+        editor.text_buffer = "1,00;0,010;0,100".into();
+        editor.commit_text();
+        let report = editor.info_overlay.as_deref().unwrap();
+        assert!(report.contains("c₁V₁ = c₂V₂"));
+        assert!(report.contains("0.100000 mol/L"));
+
+        editor.language = Language::Danish;
+        editor.start_acid_base_input(TextTarget::BasicCalculation(
+            kemi_a::BasicCalculation::AmountFromMass,
+        ));
+        editor.text_buffer = "5,844;58,44".into();
+        editor.commit_text();
+        let report = editor.info_overlay.as_deref().unwrap();
+        assert!(report.contains("Stofmængde fra masse"));
+        assert!(report.contains("0.100000 mol"));
+    }
+
+    #[test]
+    fn local_helper_and_learning_center_are_available_from_help_menu() {
+        let mut editor = Editor::new();
+        assert!(menu_items(9).contains(&"Learning center"));
+        assert!(menu_items(9).contains(&"Ask local chemistry helper"));
+        assert!(menu_items(9).contains(&"Chemistry A practice"));
+
+        editor.menu_action("Learning center");
+        assert!(editor.learning_open);
+        assert_eq!(editor.study_topic, study::Topic::GettingStarted);
+
+        editor.menu_action("Ask local chemistry helper");
+        assert!(matches!(
+            editor.text_target,
+            Some(TextTarget::TutorQuestion)
+        ));
+        editor.text_buffer = "Hvordan beregner jeg pH i en buffer?".into();
+        editor.commit_text();
+        assert!(editor.learning_open);
+        let reply = editor.tutor_reply.as_ref().unwrap();
+        assert_eq!(reply.topic, Some(study::Topic::Buffer));
+        assert!(reply.body.contains("pH = pKa + log₁₀([A⁻]/[HA])"));
+    }
+
+    #[test]
+    fn chemistry_a_practice_selects_first_unsolved_task_and_keeps_bad_answers_local() {
+        let mut editor = Editor::new();
+        editor.chemistry_a_progress.clear();
+        editor.menu_action("Chemistry A practice");
+        assert!(editor.lesson_open);
+        assert_eq!(editor.lesson.as_ref().unwrap().step, 0);
+        assert!(matches!(
+            &editor.lesson.as_ref().unwrap().content,
+            LessonContent::ChemistryA { .. }
+        ));
+        editor.chemistry_a_progress.insert(0);
+        editor.start_chemistry_a_lesson();
+        assert_eq!(editor.lesson.as_ref().unwrap().step, 1);
+        editor.text_target = Some(TextTarget::ChemistryAAnswer(1));
+        editor.text_buffer = "not a number".into();
+        editor.commit_text();
+        assert!(editor.lesson_open);
+        assert!(matches!(
+            &editor.lesson.as_ref().unwrap().content,
+            LessonContent::ChemistryA {
+                feedback: Some((false, _)),
+                ..
+            }
+        ));
+        assert!(editor.chemistry_a_progress.contains(&0));
+        assert!(!editor.chemistry_a_progress.contains(&1));
+    }
+
+    #[test]
+    fn chemistry_a_progress_is_persisted_separately_and_ignores_invalid_indices() {
+        let path = std::env::temp_dir().join(format!(
+            "molecula-chemistry-a-progress-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "0\n3\n999\nbad\n").unwrap();
+        assert_eq!(
+            load_chemistry_a_progress_from(&path),
+            BTreeSet::from([0, 3])
+        );
+        let progress = BTreeSet::from([1, 2]);
+        save_chemistry_a_progress_to(&path, &progress).unwrap();
+        assert_eq!(load_chemistry_a_progress_from(&path), progress);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
