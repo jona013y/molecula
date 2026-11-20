@@ -120,7 +120,11 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - [x] Add a searchable Danish/English learning center with bundled, reviewed guides and a context menu entry.
 - [x] Add an offline local chemistry helper that answers a bounded set of reviewed topics and clearly declines unsupported or structure-based pKa questions; no network, account, API key or generative model is used.
 - [x] Add Kemi A amount/mass/concentration/dilution and pH/pOH calculators with equations, substitutions, units and validation; retain the existing pKa and equilibrium workbench.
-- [x] Add four interactive numerical Kemi A exercises with progressive hints, answer grading through the same local calculation methods, and locally persisted solved progress.
+- [x] Retain pKa from measured buffer data, polyprotic speciation/Bjerrum diagrams and interactive charge-balance titration curves; reports require supplied pKa values and state ideal-solution conditions.
+- [x] Add limiting-reactant, theoretical-yield and percent-yield calculations from a balanced equation's entered coefficients and measured amounts; amounts are not inferred from the drawing.
+- [x] Add 3–5 significant-figure display precision to basic and acid/base calculation reports, with persisted preference, decimal-comma Danish output, and unrounded internal calculations.
+- [x] Add seven interactive numerical Kemi A exercises with progressive hints, answer grading through shared calculation routines, and locally persisted solved progress.
+- [x] Link reaction-analysis guidance to the yield calculator while explicitly asking learners to enter quantities separately from the drawn reaction.
 - Add a guided, interactive lesson flow for drawing common structures and reactions.
 - Explain naming steps on the canvas and let the learner reveal functional-group priority, parent chain, numbering and prefixes one at a time.
 - Add reaction balancing practice with immediate, evidence-based feedback; do not grade unsupported structures.
@@ -129,7 +133,7 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 
 **Dependencies:** no external service for the initial lessons.
 
-**Current implementation boundary:** the helper uses a small keyword/intent matcher over bundled reviewed content. It is not a generative AI, has no access to the drawn structure and does not predict structure-based pKa. The guides and four exercises are a starter set, not a complete Chemistry A curriculum.
+**Current implementation boundary:** the helper uses a small keyword/intent matcher over bundled reviewed content. It is not a generative AI, has no access to the drawn structure and does not predict structure-based pKa or infer quantities from a drawing. The guides and seven exercises are a starter set, not a complete Chemistry A curriculum.
 
 ### G. Chemistry lookup and property reports — partial
 
