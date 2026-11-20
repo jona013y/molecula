@@ -385,6 +385,35 @@ fn save_zoom_preference_to(path: &Path, zoom: f32) -> std::io::Result<()> {
     }
     save_setting(path, "zoom", &format!("{:.4}", zoom.clamp(0.2, 4.0)))
 }
+fn load_significant_figures() -> u8 {
+    load_significant_figures_from(&settings_path())
+}
+fn load_significant_figures_from(path: &Path) -> u8 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|settings| {
+            settings.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("significant_figures=")?
+                    .parse::<u8>()
+                    .ok()
+            })
+        })
+        .filter(|figures| (2..=6).contains(figures))
+        .unwrap_or(4)
+}
+fn save_significant_figures(figures: u8) -> std::io::Result<()> {
+    save_significant_figures_to(&settings_path(), figures)
+}
+fn save_significant_figures_to(path: &Path, figures: u8) -> std::io::Result<()> {
+    if !(2..=6).contains(&figures) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Significant figures must be 2–6",
+        ));
+    }
+    save_setting(path, "significant_figures", &figures.to_string())
+}
 fn save_dark_theme(dark: bool) -> std::io::Result<()> {
     save_setting(
         &settings_path(),
@@ -504,6 +533,10 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "[OH⁻] from pOH" => "[OH⁻] fra pOH",
         "pH from pOH" => "pH fra pOH",
         "pOH from pH" => "pOH fra pH",
+        "Calculation significant figures" => "Betydende cifre i beregninger",
+        "Limiting reactant & yield" => "Begrænsende reaktant og udbytte",
+        "Reactant coefficients (spaces); reactant amounts mol (spaces); product coefficient; product molar mass g/mol; optional actual product mass g" => "Reaktantkoefficienter (mellemrum); stofmængder mol (mellemrum); produktkoefficient; produktets molarmasse g/mol; evt. faktisk produktmasse g",
+        "Example: 2 1; 0.30 0.10; 2; 18.015; 3.20" => "Eksempel: 2 1; 0,30 0,10; 2; 18,015; 3,20",
         "Chemistry A acid-base workbench" => "Kemi A: syre-baseberegner",
         "Buffer pH from pKa" => "Buffer-pH ud fra pKa",
         "pKa from buffer measurements" => "pKa ud fra buffermåling",
@@ -1454,6 +1487,7 @@ enum TextTarget {
     BjerrumDiagram,
     PolyproticTitrationPh,
     PolyproticTitrationCurve,
+    StoichiometryYield,
     BasicCalculation(kemi_a::BasicCalculation),
     TutorQuestion,
     ChemistryAAnswer(usize),
@@ -1484,6 +1518,7 @@ fn acid_base_prompt(target: TextTarget, language: Language) -> Option<String> {
         TextTarget::PolyproticTitrationCurve => Some(
             "pKa values separated by |; acid volume mL; acid M; base M; max equivalents".into(),
         ),
+        TextTarget::StoichiometryYield => Some("Reactant coefficients (spaces); reactant amounts mol (spaces); product coefficient; product molar mass g/mol; optional actual product mass g".into()),
         _ => None,
     }
 }
@@ -1501,6 +1536,7 @@ fn acid_base_example(target: TextTarget, language: Language) -> Option<String> {
         TextTarget::BjerrumDiagram => Some("Example: 2.15|7.20; 0; 14; 0.5".into()),
         TextTarget::PolyproticTitrationPh => Some("Example: 4.76; 25; 0.10; 0.10; 12.5".into()),
         TextTarget::PolyproticTitrationCurve => Some("Example: 4.76; 25; 0.10; 0.10; 1.5".into()),
+        TextTarget::StoichiometryYield => Some("Example: 2 1; 0.30 0.10; 2; 18.015; 3.20".into()),
         _ => None,
     }
 }
@@ -1576,6 +1612,10 @@ fn localize_acid_base_report(language: Language, report: String) -> String {
         ("V(base), mL", "V(base), mL"),
         ("Each α is the fraction of one successive protonation state. Ideal aqueous model; supplied pKa values are not predicted.", "Hver α er andelen af én protoneringstilstand. Ideel vandig model; indtastede pKa-værdier forudsiges ikke."),
         ("Table values can be plotted externally.", "Værdierne vises også som diagram og kan kopieres som CSV."),
+        ("Display precision:", "Visningspræcision:"),
+        (" significant figures; pH/pKa use ", " betydende cifre; pH/pKa vises med "),
+        (" significant figures; pH uses ", " betydende cifre; pH vises med "),
+        (" decimal places.", " decimaler."),
     ]
     .into_iter()
     .fold(report, |text, (from, to)| text.replace(from, to))
@@ -1868,6 +1908,7 @@ struct Editor {
     language: Language,
     dark_theme: bool,
     show_implicit_hydrogens: bool,
+    significant_figures: u8,
     arrow_kind: String,
     pending_arrow: Option<Vec2>,
     calc_rx: Option<(Molecule, Receiver<Result<String, String>>)>,
@@ -1899,6 +1940,16 @@ impl Editor {
         self.status = match save_dark_theme(dark) {
             Ok(()) => "Appearance saved".into(),
             Err(_) => "Could not save appearance preference".into(),
+        };
+    }
+    fn set_significant_figures(&mut self, figures: u8) {
+        if !(2..=6).contains(&figures) {
+            return;
+        }
+        self.significant_figures = figures;
+        self.status = match save_significant_figures(figures) {
+            Ok(()) => format!("Calculation display set to {figures} significant figures"),
+            Err(error) => format!("Could not save calculation precision: {error}"),
         };
     }
     fn persist_zoom_preference(&mut self) {
@@ -2054,6 +2105,7 @@ impl Editor {
             language: load_language(),
             dark_theme: load_dark_theme(),
             show_implicit_hydrogens: load_implicit_hydrogen_visibility(),
+            significant_figures: load_significant_figures(),
             arrow_kind: "reaction".into(),
             pending_arrow: None,
             calc_rx: None,
@@ -5479,7 +5531,8 @@ impl Editor {
                 | TextTarget::PolyproticSpeciation
                 | TextTarget::BjerrumDiagram
                 | TextTarget::PolyproticTitrationPh
-                | TextTarget::PolyproticTitrationCurve => {
+                | TextTarget::PolyproticTitrationCurve
+                | TextTarget::StoichiometryYield => {
                     self.calculate_acid_base(target, &self.text_buffer.clone());
                     self.text_buffer.clear();
                     return;
@@ -5488,8 +5541,13 @@ impl Editor {
                     let input = self.text_buffer.clone();
                     let danish = self.language == Language::Danish;
                     self.info_overlay = Some(
-                        kemi_a::calculate(calculation, &input, danish)
-                            .unwrap_or_else(|error| localize_kemi_a_error(&error, danish)),
+                        kemi_a::calculate_with_significant_figures(
+                            calculation,
+                            &input,
+                            danish,
+                            self.significant_figures,
+                        )
+                        .unwrap_or_else(|error| localize_kemi_a_error(&error, danish)),
                     );
                     self.info_scroll = 0;
                     self.text_buffer.clear();
@@ -5570,6 +5628,7 @@ impl Editor {
                 | TextTarget::BjerrumDiagram
                 | TextTarget::PolyproticTitrationPh
                 | TextTarget::PolyproticTitrationCurve
+                | TextTarget::StoichiometryYield
                 | TextTarget::BasicCalculation(_)
                 | TextTarget::TutorQuestion
                 | TextTarget::StudySearch
@@ -5585,6 +5644,10 @@ impl Editor {
     }
     fn calculate_acid_base(&mut self, target: TextTarget, input: &str) {
         self.acid_base_chart = None;
+        let figures = self.significant_figures;
+        let danish = self.language == Language::Danish;
+        let sig = |value: f64| kemi_a::format_significant_locale(value, figures, danish);
+        let log_value = |value: f64| kemi_a::format_log_quantity(value, figures, danish);
         let parse_fields = |count: usize| -> Result<Vec<f64>, String> {
             let fields: Vec<&str> = input.split(';').map(str::trim).collect();
             if fields.len() != count {
@@ -5617,40 +5680,40 @@ impl Editor {
                     let v = parse_fields(3)?;
                     let ph = acid_base::buffer_ph(v[0], v[1], v[2])?;
                     Ok(format!(
-                        "Buffer pH = {ph:.4}\n\npKa = {:.4}\n[HA] = {:.6} mol/L\n[A⁻] = {:.6} mol/L\nMethod: Henderson–Hasselbalch, pH = pKa + log₁₀([A⁻]/[HA]). Aqueous ideal-solution calculation.",
-                        v[0], v[1], v[2]
+                        "Buffer pH = {}\n\npKa = {}\n[HA] = {} mol/L\n[A⁻] = {} mol/L\nMethod: Henderson–Hasselbalch, pH = pKa + log₁₀([A⁻]/[HA]). Aqueous ideal-solution calculation. Display precision: {figures} significant figures; pH/pKa use {figures} decimal places.",
+                        log_value(ph), log_value(v[0]), sig(v[1]), sig(v[2])
                     ))
                 }
                 TextTarget::PkaFromBuffer => {
                     let v = parse_fields(3)?;
                     let pka = acid_base::pka_from_buffer(v[0], v[1], v[2])?;
                     Ok(format!(
-                        "pKa = {pka:.4}\n\nMeasured pH = {:.4}\n[HA] = {:.6} mol/L\n[A⁻] = {:.6} mol/L\nMethod: rearranged Henderson–Hasselbalch. This derives a pKa from supplied measurement data; it is not a structure-based prediction.",
-                        v[0], v[1], v[2]
+                        "pKa = {}\n\nMeasured pH = {}\n[HA] = {} mol/L\n[A⁻] = {} mol/L\nMethod: rearranged Henderson–Hasselbalch. This derives a pKa from supplied measurement data; it is not a structure-based prediction. Display precision: {figures} significant figures; pH/pKa use {figures} decimal places.",
+                        log_value(pka), log_value(v[0]), sig(v[1]), sig(v[2])
                     ))
                 }
                 TextTarget::WeakAcidPh => {
                     let v = parse_fields(2)?;
                     let ph = acid_base::weak_acid_ph(v[0], v[1])?;
                     Ok(format!(
-                        "Weak-acid pH = {ph:.4}\n\npKa = {:.4}\nInitial concentration = {:.6} mol/L\nMethod: ideal aqueous monoprotic equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C.",
-                        v[0], v[1]
+                        "Weak-acid pH = {}\n\npKa = {}\nInitial concentration = {} mol/L\nMethod: ideal aqueous monoprotic equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C. Display precision: {figures} significant figures; pH/pKa use {figures} decimal places.",
+                        log_value(ph), log_value(v[0]), sig(v[1])
                     ))
                 }
                 TextTarget::WeakBasePh => {
                     let v = parse_fields(2)?;
                     let ph = acid_base::weak_base_ph(v[0], v[1])?;
                     Ok(format!(
-                        "Weak-base pH = {ph:.4}\n\npKa of BH⁺ = {:.4}\nInitial base concentration = {:.6} mol/L\nMethod: ideal aqueous conjugate-acid equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C.",
-                        v[0], v[1]
+                        "Weak-base pH = {}\n\npKa of BH⁺ = {}\nInitial base concentration = {} mol/L\nMethod: ideal aqueous conjugate-acid equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C. Display precision: {figures} significant figures; pH/pKa use {figures} decimal places.",
+                        log_value(ph), log_value(v[0]), sig(v[1])
                     ))
                 }
                 TextTarget::StrongMixturePh => {
                     let v = parse_fields(2)?;
                     let ph = acid_base::strong_mixture_ph(v[0], v[1])?;
                     Ok(format!(
-                        "Strong acid/base mixture pH = {ph:.4}\n\nFinal strong-acid concentration = {:.6} mol/L\nFinal strong-base concentration = {:.6} mol/L\nMethod: neutralization and water ion balance, Kw = 1.0×10⁻¹⁴ at 25 °C. Enter concentrations after any volume change.",
-                        v[0], v[1]
+                        "Strong acid/base mixture pH = {}\n\nFinal strong-acid concentration = {} mol/L\nFinal strong-base concentration = {} mol/L\nMethod: neutralization and water ion balance, Kw = 1.0×10⁻¹⁴ at 25 °C. Enter concentrations after any volume change. Display precision: {figures} significant figures; pH uses {figures} decimal places.",
+                        log_value(ph), sig(v[0]), sig(v[1])
                     ))
                 }
                 TextTarget::PolyproticSpeciation => {
@@ -5687,13 +5750,13 @@ impl Editor {
                                 };
                                 format!("{hydrogen}A{}−", charge_suffix(lost))
                             };
-                            format!("{formula}: {:.3}%", fraction * 100.0)
+                            format!("{formula}: {}%", sig(fraction * 100.0))
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
                     Ok(format!(
-                        "Polyprotic acid speciation at pH {ph:.3}\n\npKa values: {}\n\n{rows}\n\nMethod: successive ideal aqueous dissociation equilibria; fractions sum to 100%.",
-                        pkas.iter().map(|pka| format!("{pka:.3}")).collect::<Vec<_>>().join(", ")
+                        "Polyprotic acid speciation at pH {}\n\npKa values: {}\n\n{rows}\n\nMethod: successive ideal aqueous dissociation equilibria; fractions sum to 100%. Display precision: {figures} significant figures; pH/pKa use {figures} decimal places.",
+                        log_value(ph), pkas.iter().map(|pka| log_value(*pka)).collect::<Vec<_>>().join(", ")
                     ))
                 }
                 TextTarget::BjerrumDiagram => {
@@ -5732,7 +5795,7 @@ impl Editor {
                     let mut output = format!(
                         "Bjerrum distribution table\npKa: {}\n\n",
                         pkas.iter()
-                            .map(|pka| format!("{pka:.3}"))
+                            .map(|pka| log_value(*pka))
                             .collect::<Vec<_>>()
                             .join(" | ")
                     );
@@ -5741,9 +5804,9 @@ impl Editor {
                         output.push_str(&format!("\tα{index} (%)"));
                     }
                     for (ph, fractions) in points {
-                        output.push_str(&format!("\n{ph:.2}"));
+                        output.push_str(&format!("\n{}", log_value(ph)));
                         for fraction in fractions {
-                            output.push_str(&format!("\t{:.2}", fraction * 100.0));
+                            output.push_str(&format!("\t{}", sig(fraction * 100.0)));
                         }
                     }
                     output.push_str("\n\nEach α is the fraction of one successive protonation state. Ideal aqueous model; supplied pKa values are not predicted.");
@@ -5775,9 +5838,9 @@ impl Editor {
                         values[3] / 1000.0,
                     )?;
                     Ok(format!(
-                        "Titration pH = {ph:.4}\n\npKa values: {}\nInitial acid: {:.3} mL × {:.6} mol/L\nAdded strong base: {:.3} mL × {:.6} mol/L\nMethod: polyprotic distribution plus electroneutrality after dilution; ideal aqueous conditions, 25 °C.",
-                        pkas.iter().map(|pka| format!("{pka:.3}")).collect::<Vec<_>>().join(", "),
-                        values[0], values[1], values[3], values[2]
+                        "Titration pH = {}\n\npKa values: {}\nInitial acid: {} mL × {} mol/L\nAdded strong base: {} mL × {} mol/L\nMethod: polyprotic distribution plus electroneutrality after dilution; ideal aqueous conditions, 25 °C. Display precision: {figures} significant figures; pH/pKa use {figures} decimal places.",
+                        log_value(ph), pkas.iter().map(|pka| log_value(*pka)).collect::<Vec<_>>().join(", "),
+                        sig(values[0]), sig(values[1]), sig(values[3]), sig(values[2])
                     ))
                 }
                 TextTarget::PolyproticTitrationCurve => {
@@ -5820,16 +5883,21 @@ impl Editor {
                     let mut output = format!(
                         "Titration curve points\npKa values: {}\n\nV(base), mL\tpH",
                         pkas.iter()
-                            .map(|pka| format!("{pka:.3}"))
+                            .map(|pka| log_value(*pka))
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
                     for (volume, ph) in curve {
-                        output.push_str(&format!("\n{:.4}\t{ph:.4}", volume * 1000.0));
+                        output.push_str(&format!("\n{}\t{}", sig(volume * 1000.0), log_value(ph)));
                     }
                     output.push_str("\n\nMethod: equilibrium charge balance for a polyprotic acid titrated with a strong base; ideal aqueous conditions, 25 °C. Table values can be plotted externally.");
                     Ok(output)
                 }
+                TextTarget::StoichiometryYield => kemi_a::stoichiometric_yield(
+                    input,
+                    self.language == Language::Danish,
+                    self.significant_figures,
+                ),
                 _ => Err("This is not an acid/base calculation input".into()),
             }
         })();
@@ -11185,6 +11253,10 @@ async fn main() {
                     TextTarget::PolyproticTitrationCurve,
                     localized(e.language, "Polyprotic titration curve").into_owned(),
                 ),
+                (
+                    TextTarget::StoichiometryYield,
+                    localized(e.language, "Limiting reactant & yield").into_owned(),
+                ),
             ];
             tools.extend(
                 kemi_a::BasicCalculation::ALL
@@ -11249,7 +11321,7 @@ async fn main() {
             UI_INPUT_ENABLED.with(|enabled| enabled.set(false));
         } else if e.settings_open {
             let width = 440.;
-            let height = 400.;
+            let height = 520.;
             let x = (w - width) / 2.;
             let y = (h - height) / 2.;
             round_rect(
@@ -11308,15 +11380,34 @@ async fn main() {
                 e.set_dark_theme(!e.dark_theme);
             }
             draw_text(
+                &localized(e.language, "Calculation significant figures"),
+                x + 24.,
+                y + 286.,
+                16.,
+                ink(),
+            );
+            for (index, figures) in [3_u8, 4, 5].into_iter().enumerate() {
+                if button(
+                    x + 24. + index as f32 * 128.,
+                    y + 301.,
+                    116.,
+                    38.,
+                    &format!("{figures} sf"),
+                    e.significant_figures == figures,
+                ) {
+                    e.set_significant_figures(figures);
+                }
+            }
+            draw_text(
                 &localized(e.language, "Implicit hydrogen labels"),
                 x + 24.,
-                y + 285.,
+                y + 363.,
                 17.,
                 ink(),
             );
             if button(
                 x + 24.,
-                y + 303.,
+                y + 381.,
                 392.,
                 42.,
                 &localized(
@@ -11337,7 +11428,7 @@ async fn main() {
                     "Language and appearance are saved automatically.",
                 ),
                 x + 24.,
-                y + 366.,
+                y + 445.,
                 14.,
                 muted(),
             );
@@ -12209,6 +12300,8 @@ mod tests {
     #[test]
     fn chemistry_a_workbench_routes_inputs_to_real_pka_and_ph_calculations() {
         let mut editor = Editor::new();
+        editor.language = Language::English;
+        editor.significant_figures = 4;
         editor.menu_action("Chemistry A acid/base tools");
         assert!(editor.acid_base_open);
 
@@ -12255,11 +12348,12 @@ mod tests {
     fn chemistry_a_workbench_localizes_calculation_results_and_keeps_plottable_data() {
         let mut editor = Editor::new();
         editor.language = Language::Danish;
+        editor.significant_figures = 4;
         editor.calculate_acid_base(TextTarget::BufferPh, "4.76;0.1;0.2");
         assert!(editor
             .info_overlay
             .as_deref()
-            .is_some_and(|report| report.contains("Buffer-pH = 5.0610")));
+            .is_some_and(|report| report.contains("Buffer-pH = 5,0610")));
 
         editor.calculate_acid_base(TextTarget::PolyproticTitrationCurve, "4.76;25;0.1;0.1;1.5");
         let curve = editor.acid_base_chart.as_ref().unwrap();
@@ -12296,6 +12390,8 @@ mod tests {
     #[test]
     fn general_chemistry_a_tools_route_through_the_real_input_dialog() {
         let mut editor = Editor::new();
+        editor.language = Language::English;
+        editor.significant_figures = 4;
         editor.menu_action("Chemistry A calculations");
         assert!(editor.acid_base_open);
         editor.start_acid_base_input(TextTarget::BasicCalculation(
@@ -12305,7 +12401,7 @@ mod tests {
         editor.commit_text();
         let report = editor.info_overlay.as_deref().unwrap();
         assert!(report.contains("c₁V₁ = c₂V₂"));
-        assert!(report.contains("0.100000 mol/L"));
+        assert!(report.contains("0.1000 mol/L"));
 
         editor.language = Language::Danish;
         editor.start_acid_base_input(TextTarget::BasicCalculation(
@@ -12315,7 +12411,24 @@ mod tests {
         editor.commit_text();
         let report = editor.info_overlay.as_deref().unwrap();
         assert!(report.contains("Stofmængde fra masse"));
-        assert!(report.contains("0.100000 mol"));
+        assert!(report.contains("0,1000 mol"));
+
+        editor.significant_figures = 3;
+        editor.start_acid_base_input(TextTarget::BasicCalculation(
+            kemi_a::BasicCalculation::MassFromAmount,
+        ));
+        editor.text_buffer = "0.100;58.44".into();
+        editor.commit_text();
+        assert!(editor.info_overlay.as_deref().unwrap().contains("5,84 g"));
+
+        editor.start_acid_base_input(TextTarget::StoichiometryYield);
+        editor.text_buffer = "2 1; 0,30 0,10; 2; 18,015; 3,20".into();
+        editor.commit_text();
+        let report = editor.info_overlay.as_deref().unwrap();
+        assert!(report.contains("Begrænsende reaktant"));
+        assert!(report.contains("Reaktant 2"));
+        assert!(report.contains("Procentudbytte"));
+        assert!(report.contains("0,200 mol"));
     }
 
     #[test]
@@ -13516,14 +13629,18 @@ mod tests {
         save_setting(&path, "theme", "dark").unwrap();
         save_implicit_hydrogen_visibility_to(&path, true).unwrap();
         save_zoom_preference_to(&path, 1.75).unwrap();
+        save_significant_figures_to(&path, 5).unwrap();
         assert_eq!(load_language_from(&path), Language::Danish);
         assert!(load_implicit_hydrogen_visibility_from(&path));
         assert_eq!(load_zoom_preference_from(&path), 1.75);
+        assert_eq!(load_significant_figures_from(&path), 5);
         save_language_to(&path, Language::English).unwrap();
         let settings = fs::read_to_string(&path).unwrap();
         assert!(settings.contains("theme=dark"));
         assert!(settings.contains("show_implicit_hydrogens=true"));
         assert!(settings.contains("zoom=1.7500"));
+        assert!(settings.contains("significant_figures=5"));
+        assert!(save_significant_figures_to(&path, 9).is_err());
         assert_eq!(localized(Language::Danish, "Calculations"), "Beregninger");
         assert_eq!(localized(Language::English, "Calculations"), "Calculations");
         assert_eq!(

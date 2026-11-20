@@ -58,8 +58,8 @@ impl Topic {
             (Self::Titration, false) => "In an acid-base titration, a solution of known concentration is added to the analyte.\n\nAt the equivalence point, the amounts of acid and base have reacted in the stoichiometric ratio from the reaction equation. For a monoprotic acid and strong base, n(OH⁻) = n(HA) at equivalence.\n\nBefore equivalence, the solution may behave as a buffer; at equivalence, product acid-base properties determine pH. After equivalence, excess titrant determines pH.\n\nMolecula's polyprotic titration curve uses ideal equilibrium at 25 °C and requires pKa values.",
             (Self::AmountConcentration, true) => "Stofmængde og koncentration forbindes med n = m/M og c = n/V.\n\nn måles i mol, m i g, M i g/mol, V i L og c i mol/L.\n\nVed fortynding bevares stofmængden af opløst stof: c₁V₁ = c₂V₂. Brug samme volumen-enhed på begge sider.\n\nVælg Beregninger → Kemi A: stofmængde, fortynding eller koncentration for at få trin og enheder vist.",
             (Self::AmountConcentration, false) => "Amount and concentration are related by n = m/M and c = n/V.\n\nn is in mol, m in g, M in g/mol, V in L and c in mol/L.\n\nDuring dilution, the amount of dissolved substance is conserved: c₁V₁ = c₂V₂. Use the same volume unit on both sides.\n\nChoose Calculations → Chemistry A: amount, dilution or concentration to see the worked steps and units.",
-            (Self::Reaction, true) => "En reaktions ligning afstemmes ved at bevare hvert grundstofs antal atomer og den samlede ladning. Koefficienter ændres; kemiske indeks i formler ændres ikke.\n\nI editoren: tegn reaktanter og produkter som adskilte komponenter, sæt deres rolle i inspektøren, og tilføj reaktionspil. Vælg Beregninger → Afstem reaktion.\n\nHvis der findes flere løsninger eller utilstrækkelige oplysninger, afviser Molecula automatisk ændringen i stedet for at gætte.",
-            (Self::Reaction, false) => "A reaction equation is balanced by conserving the number of atoms of every element and total charge. Change coefficients; do not change subscripts in formulas.\n\nIn the editor, draw reactants and products as separate components, assign their role in the inspector, and add a reaction arrow. Choose Calculations → Auto-balance reaction.\n\nIf multiple solutions or insufficient information exist, Molecula refuses to guess.",
+            (Self::Reaction, true) => "En reaktions ligning afstemmes ved at bevare hvert grundstofs antal atomer og den samlede ladning. Koefficienter ændres; kemiske indeks i formler ændres ikke.\n\nI editoren: tegn reaktanter og produkter som adskilte komponenter, sæt deres rolle i inspektøren, og tilføj reaktionspil. Vælg Beregninger → Afstem reaktion eller Reaktionsanalyse for at kontrollere grafens formler, molarmasser og atom-/ladningsbalance.\n\nBrug derefter Begrænsende reaktant og udbytte til at indtaste de afstemte reaktantkoefficienter og de kendte stofmængder. Mængder kan ikke udledes af tegningen, så de indtastes særskilt.\n\nHvis der findes flere løsninger eller utilstrækkelige oplysninger, afviser Molecula automatisk ændringen i stedet for at gætte.",
+            (Self::Reaction, false) => "A reaction equation is balanced by conserving the number of atoms of every element and total charge. Change coefficients; do not change subscripts in formulas.\n\nIn the editor, draw reactants and products as separate components, assign their role in the inspector, and add a reaction arrow. Choose Calculations → Auto-balance reaction or Reaction analysis to check graph formulas, molar masses, and atom/charge balance.\n\nThen use Limiting reactant & yield to enter the balanced reactant coefficients and known amounts. Quantities cannot be inferred from a drawing, so enter them separately.\n\nIf multiple solutions or insufficient information exist, Molecula refuses to guess.",
             (Self::Naming, true) => "Moleculas navngivningslektion viser de trin, som den indbyggede navngiver faktisk understøtter, og fremhæver atomerne.\n\nNavngiveren er et undervisningsudsnit, ikke en komplet IUPAC-motor. Hvis en struktur ikke understøttes, viser Molecula årsagen i stedet for at præsentere et usikkert navn som korrekt.\n\nTegn en støttet struktur, og vælg Hjælp → Navngivningslektion.",
             (Self::Naming, false) => "Molecula's naming lesson shows the steps supported by its built-in namer and highlights the atoms.\n\nThe namer is a teaching subset, not a complete IUPAC engine. If a structure is unsupported, Molecula reports why instead of presenting an uncertain name as correct.\n\nDraw a supported structure and choose Help → Naming lesson.",
             (Self::Editor, true) => "Vigtige genveje: 1/2/3 vælger enkelt-, dobbelt- og tripelbinding; 4 vælger aromatisk binding; Esc skifter til markering; Delete sletter markeringen.\n\nTræk med markeringsværktøjet for at flytte eller markere. Klik midt på en eksisterende binding med bindingstasten 2 for at gøre den dobbelt.\n\nHelp → Shortcuts viser flere genveje. Kommandopaletten åbnes med Cmd/Ctrl+Shift+P.",
@@ -84,7 +84,7 @@ pub struct Exercise {
     pub worked_steps: &'static str,
 }
 
-pub const CHEMISTRY_A_EXERCISE_COUNT: usize = 4;
+pub const CHEMISTRY_A_EXERCISE_COUNT: usize = 7;
 
 pub fn exercise(index: usize, da: bool) -> Option<Exercise> {
     Some(match (index, da) {
@@ -144,6 +144,12 @@ pub fn exercise(index: usize, da: bool) -> Option<Exercise> {
             hint_two: "Before equivalence, both HA and A⁻ are present; their ratio sets buffer pH.",
             worked_steps: "Half the base needed for equivalence has been added. In the ideal monoprotic model [A⁻] = [HA], so pH = pKa = 4.76.",
         },
+        (4, true) => Exercise { title: "Begrænsende reaktant", prompt: "Reaktionen 2 H₂ + O₂ → 2 H₂O. Du har 0,30 mol H₂ og 0,10 mol O₂. Hvor meget H₂O kan højst dannes i mol?", hint_one: "Sammenlign n/ν for hver reaktant.", hint_two: "Reaktionsomfanget er min(0,30/2; 0,10/1). Gang med produktkoefficienten 2.", worked_steps: "O₂ begrænser reaktionen: ξ = 0,10 mol. Derfor dannes højst 2ξ = 0,20 mol H₂O." },
+        (5, true) => Exercise { title: "Procentudbytte", prompt: "Det teoretiske udbytte er 0,200 mol H₂O (M = 18,015 g/mol). Der isoleres 3,20 g. Beregn procentudbyttet.", hint_one: "Beregn først den teoretiske masse fra n · M.", hint_two: "Procentudbytte = faktisk masse / teoretisk masse · 100 %.", worked_steps: "m(teoretisk) = 0,200 · 18,015 = 3,603 g. Udbytte = 3,20/3,603 · 100 % ≈ 88,8 %." },
+        (6, true) => Exercise { title: "Betydende cifre", prompt: "Afrund 0,012345 g til tre betydende cifre. Indtast talværdien.", hint_one: "De tre første betydende cifre er 1, 2 og 3.", hint_two: "Det næste ciffer er 4, så det tredje ciffer forbliver uændret.", worked_steps: "0,012345 g afrundet til tre betydende cifre er 0,0123 g." },
+        (4, false) => Exercise { title: "Limiting reactant", prompt: "For 2 H₂ + O₂ → 2 H₂O, you have 0.30 mol H₂ and 0.10 mol O₂. What maximum amount of H₂O forms, in mol?", hint_one: "Compare n/ν for each reactant.", hint_two: "The reaction extent is min(0.30/2; 0.10/1). Multiply by the product coefficient 2.", worked_steps: "O₂ is limiting: ξ = 0.10 mol. Therefore at most 2ξ = 0.20 mol H₂O forms." },
+        (5, false) => Exercise { title: "Percent yield", prompt: "The theoretical yield is 0.200 mol H₂O (M = 18.015 g/mol). You isolate 3.20 g. Calculate percent yield.", hint_one: "First calculate theoretical mass from n · M.", hint_two: "Percent yield = actual mass / theoretical mass · 100%.", worked_steps: "m(theoretical) = 0.200 · 18.015 = 3.603 g. Yield = 3.20/3.603 · 100% ≈ 88.8%." },
+        (6, false) => Exercise { title: "Significant figures", prompt: "Round 0.012345 g to three significant figures. Enter the numerical value.", hint_one: "The first three significant digits are 1, 2 and 3.", hint_two: "The next digit is 4, so the third digit stays unchanged.", worked_steps: "0.012345 g rounded to three significant figures is 0.0123 g." },
         _ => return None,
     })
 }
@@ -156,6 +162,9 @@ fn exercise_expected(index: usize) -> Option<f64> {
         3 => {
             crate::acid_base::polyprotic_titration_ph(&[4.76], 0.0250, 0.100, 0.100, 0.0125).ok()?
         }
+        4 => 0.200,
+        5 => 3.20 / (0.200 * 18.015) * 100.0,
+        6 => 0.0123,
         _ => return None,
     })
 }
@@ -227,6 +236,10 @@ pub fn check_exercise(index: usize, input: &str, da: bool) -> Option<(bool, Stri
     }
     let tolerance = if index == 0 || index == 1 || index == 3 {
         0.03
+    } else if index == 5 {
+        0.15
+    } else if index == 6 {
+        0.000_01
     } else {
         0.002
     };
@@ -499,6 +512,9 @@ mod tests {
         assert!(ok);
         let (ok, _) = check_exercise(2, "0,100", true).unwrap();
         assert!(ok);
+        assert!(check_exercise(4, "0,2", true).unwrap().0);
+        assert!(check_exercise(5, "88,8", true).unwrap().0);
+        assert!(check_exercise(6, "0,0123", true).unwrap().0);
         let (ok, feedback) = check_exercise(3, "4.76", false).unwrap();
         assert!(ok, "{feedback}");
         assert!(check_exercise(2, "not a number", false)
