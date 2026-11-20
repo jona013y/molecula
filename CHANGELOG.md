@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.15
+
+- Add a Chemistry A limiting-reactant and yield calculator for theoretical product amount/mass and optional percent yield from actual mass.
+- Add configurable 3–5 significant-figure display precision; basic and acid/base reports now use the selected precision with decimal-comma Danish display.
+- Expand the interactive Chemistry A practice set from four to seven exercises, adding limiting reagent, percent yield and significant figures.
+- Link the drawn reaction analysis guide to yield calculations while requiring known amounts to be entered separately.
+- Keep the existing pKa, polyprotic distribution/Bjerrum charts and interactive titration curves, which were already present in v1.0.14.
+- Verify calculation equations, input validation, settings persistence, exercise grading and the full local test suite.
+
 ## v1.0.14
 
 - Add a searchable Danish/English learning center with eight reviewed, bundled Chemistry A and editor guides.

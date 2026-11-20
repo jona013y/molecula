@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "molecula"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "fontdue",
  "image",
