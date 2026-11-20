@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.14
+
+- Add a searchable Danish/English learning center with eight reviewed, bundled Chemistry A and editor guides.
+- Add an offline local chemistry helper with bounded intent matching and an explicit fallback for unsupported questions; it does not use a generative model, network service, or structure-based pKa prediction.
+- Add Chemistry A calculators for amount, mass, concentration, dilution, and pH/pOH conversions; show equations, substitutions, units, and validated answers.
+- Add four Chemistry A practice problems with progressive hints, checked answers, and locally persisted progress.
+- Verify the full Rust suite (231 tests), formatting, Clippy with warnings denied, and optimized release build.
+
 ## v1.0.13
 
 - Add a Chemistry A acid/base workbench: Henderson–Hasselbalch buffer pH and measured pKa, weak monoprotic acid/base equilibrium pH, strong acid/base mixtures, polyprotic speciation, Bjerrum diagrams and titration calculations.

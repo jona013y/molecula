@@ -10,11 +10,17 @@ The editor and visual assets are original Molecula work; no MarvinSketch source 
 
 ## Chemistry A acid/base calculations
 
-Open **Calculations → Chemistry A acid/base tools**. The workbench includes buffer pH from pKa and concentrations, pKa from measured buffer data, weak monoprotic acid/base pH, strong acid/base mixtures, polyprotic species fractions, Bjerrum diagrams, and polyprotic titration pH/curves. The Bjerrum and titration charts can copy their plotted values as CSV. Danish and English labels, reports, and example inputs are available through Settings.
+Open **Calculations → Chemistry A calculations**. In addition to buffer pH from pKa and concentrations, pKa from measured buffer data, weak monoprotic acid/base pH, strong acid/base mixtures, polyprotic species fractions, Bjerrum diagrams and polyprotic titration pH/curves, the panel includes amount from mass, mass from amount, concentration, dilution, and pH/pOH conversions. Each basic calculation shows its equation, substituted values, units, and result. The Bjerrum and titration charts can copy plotted values as CSV. Danish and English labels, reports, and example inputs are available through Settings.
 
 Enter values in the order shown in the dialog, separated by semicolons. Decimal commas or points work; separate successive pKa values with `|`. For example, a buffer input `4,76; 0,10; 0,20` gives pH about 5.06. The pKa used in an exercise must come from your class data or a cited table. Molecula does not estimate pKa from the drawn structure or invent database values.
 
 These calculations use ideal aqueous concentrations, 25 °C and `Kw = 1.0×10⁻¹⁴`; they do not correct for activity, ionic strength or other non-ideal effects. Results are intended for Chemistry A learning and should not be treated as experimentally validated predictions. See [STATUS.md](STATUS.md) for exact scope.
+
+## Learning center and local chemistry helper
+
+Open **Help → Learning center** for searchable Danish/English guides to pH, buffers, titrations, amount of substance, reactions, naming and the editor. **Help → Ask local chemistry helper** answers supported questions using reviewed, bundled material. It works offline and sends no structure or question to a service. It is a bounded keyword and intent matcher, not a generative AI model; questions outside its reviewed topics receive a clear fallback instead of an invented answer. Structure-based pKa prediction is not provided.
+
+**Help → Chemistry A practice** offers four interactive numerical exercises with progressive hints and answer checking against the same local calculation routines. Correctly solved exercise progress is stored locally beside the app settings. These guides and exercises support learning; they are not a substitute for a teacher's chosen conventions or source data.
 
 ## Download and first-run security warnings
 
