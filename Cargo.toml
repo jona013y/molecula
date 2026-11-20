@@ -1,0 +1,9 @@
+[package]
+name = "molecula"
+version = "1.0.13"
+edition = "2021"
+
+[dependencies]
+fontdue = "=0.9.5"
+image = { version = "=0.24.9", default-features = false, features = ["png"] }
+macroquad = "0.4.16"
