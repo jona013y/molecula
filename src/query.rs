@@ -1,7 +1,7 @@
 //! Small, explicit substructure matcher for Molecula's supported query subset.
 //!
 //! This is deliberately not advertised as full SMARTS: recursive queries and
-//! stereochemical matching are rejected. Ring counts use a deterministic local
+//! stereochemical matching beyond explicit stored CIP/E/Z labels are rejected. Ring counts use a deterministic local
 //! minimum cycle basis, whose tie-breaking can differ from other toolkits.
 use crate::{chemistry, shortcuts, Bond, BondStyle, Molecule};
 use std::collections::{BTreeSet, HashSet};
@@ -67,6 +67,18 @@ fn bond_matches(query: &Bond, target: &Bond, target_is_ring: bool) -> bool {
         || query_text
             .split(';')
             .any(|term| matches!(term, "topology-ring" | "topology-chain"))
+}
+
+fn bond_stereo_matches(query: &Bond, target: &Bond) -> Result<bool, String> {
+    let Some(stereo) = query.stereo.as_deref() else {
+        return Ok(true);
+    };
+    if query.order != 2 || !matches!(stereo, "E" | "Z" | "cis" | "trans") {
+        return Err(
+            "Only explicit E/Z or cis/trans labels on double-bond queries are supported".into(),
+        );
+    }
+    Ok(target.order == 2 && target.stereo.as_deref() == Some(stereo))
 }
 
 fn bond_between(molecule: &Molecule, a: usize, b: usize) -> Option<(usize, &Bond)> {
@@ -405,8 +417,19 @@ fn atom_matches(
     target: &crate::Atom,
     features: &TargetAtomFeatures,
 ) -> Result<bool, String> {
-    if query.stereo.is_some() || query.r_group.is_some() || query.alias.is_some() {
-        return Err("Substructure matching does not yet support stereochemical, R-group or alias query atoms".into());
+    if let Some(stereo) = query.stereo.as_deref() {
+        if !matches!(stereo, "R" | "S") {
+            return Err(
+                "Only explicit R/S CIP labels are supported for stereochemical atom matching"
+                    .into(),
+            );
+        }
+        if target.stereo.as_deref() != Some(stereo) {
+            return Ok(false);
+        }
+    }
+    if query.r_group.is_some() || query.alias.is_some() {
+        return Err("R-group and alias query atoms are not supported by the local matcher".into());
     }
     let terms: Vec<&str> = query
         .query
@@ -512,12 +535,10 @@ pub fn find_selected_matches(
     let mut q_adj = vec![Vec::<usize>::new(); molecule.atoms.len()];
     for (index, bond) in molecule.bonds.iter().enumerate() {
         if selected.contains(&bond.a) && selected.contains(&bond.b) {
-            if bond.stereo.is_some()
-                || !matches!(
-                    bond.style,
-                    BondStyle::Normal | BondStyle::Aromatic | BondStyle::Any
-                )
-            {
+            if !matches!(
+                bond.style,
+                BondStyle::Normal | BondStyle::Aromatic | BondStyle::Any
+            ) {
                 return Err("Stereochemical bond matching is not implemented".into());
             }
             q_adj[bond.a].push(bond.b);
@@ -766,6 +787,12 @@ pub fn find_selected_matches(
                         compatible = false;
                         break;
                     }
+                    if let Some((_, target_bond)) = target_bond {
+                        if !bond_stereo_matches(&molecule.bonds[bi], target_bond)? {
+                            compatible = false;
+                            break;
+                        }
+                    }
                 }
             }
             if compatible {
@@ -881,6 +908,53 @@ mod tests {
             matches_for("any atom"),
             vec![vec![1], vec![2], vec![3], vec![4], vec![5]]
         );
+    }
+
+    #[test]
+    fn explicit_cip_query_labels_match_only_identically_labelled_atoms() {
+        let mut molecule = Molecule::default();
+        let mut query = atom("C", None);
+        query.stereo = Some("R".into());
+        molecule.atoms.push(query);
+        let mut r_target = atom("C", None);
+        r_target.stereo = Some("R".into());
+        let mut s_target = atom("C", None);
+        s_target.stereo = Some("S".into());
+        molecule.atoms.extend([r_target, s_target, atom("C", None)]);
+        assert_eq!(
+            find_selected_matches(&molecule, &[0]).unwrap().matches,
+            vec![vec![1]]
+        );
+
+        molecule.atoms[0].stereo = Some("ABS".into());
+        assert!(find_selected_matches(&molecule, &[0])
+            .unwrap_err()
+            .contains("explicit R/S CIP labels"));
+    }
+
+    #[test]
+    fn explicit_double_bond_stereo_query_matches_only_the_same_label() {
+        let mut molecule = Molecule::default();
+        molecule.atoms.extend((0..8).map(|_| atom("C", None)));
+        molecule.bonds.extend([
+            bond(0, 1, 2, None),
+            bond(2, 3, 2, None),
+            bond(4, 5, 2, None),
+            bond(6, 7, 2, None),
+        ]);
+        molecule.bonds[0].stereo = Some("E".into());
+        molecule.bonds[1].stereo = Some("E".into());
+        molecule.bonds[2].stereo = Some("Z".into());
+        assert_eq!(
+            find_selected_matches(&molecule, &[0, 1]).unwrap().matches,
+            vec![vec![2, 3]]
+        );
+
+        molecule.bonds[0].stereo = Some("cis".into());
+        assert!(find_selected_matches(&molecule, &[0, 1])
+            .unwrap()
+            .matches
+            .is_empty());
     }
 
     #[test]

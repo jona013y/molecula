@@ -7,24 +7,80 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(target_os = "windows")]
 use std::fs::OpenOptions;
-#[cfg(target_os = "windows")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
+mod acid_base;
 mod chemistry;
+mod cml;
 mod naming;
 mod native;
+mod pubchem;
 mod query;
 mod rdkit;
 mod reaction;
 mod shortcuts;
+mod smarts;
+mod smiles;
 
 const TOP: f32 = 118.;
 const LEFT: f32 = 88.;
 const BOTTOM: f32 = 86.;
 const RIGHT: f32 = 250.;
 const BOND: f32 = 43.;
+fn rotate_template_point(point: Vec2, center: Vec2, degrees: u16) -> Vec2 {
+    let angle = f32::from(degrees % 360).to_radians();
+    let offset = point - center;
+    center
+        + vec2(
+            offset.x * angle.cos() - offset.y * angle.sin(),
+            offset.x * angle.sin() + offset.y * angle.cos(),
+        )
+}
+const AMINO_ACID_TEMPLATES: [&str; 20] = [
+    "Glycine",
+    "Alanine",
+    "Valine",
+    "Leucine",
+    "Isoleucine",
+    "Serine",
+    "Threonine",
+    "Cysteine",
+    "Methionine",
+    "Aspartic acid",
+    "Asparagine",
+    "Glutamic acid",
+    "Glutamine",
+    "Lysine",
+    "Arginine",
+    "Histidine",
+    "Phenylalanine",
+    "Tyrosine",
+    "Tryptophan",
+    "Proline",
+];
+
+fn builtin_template_matches_query(name: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    name.to_lowercase().contains(&query)
+        || (matches!(
+            query.as_str(),
+            "amino" | "amino acid" | "amino acids" | "proteinogenic"
+        ) && AMINO_ACID_TEMPLATES.contains(&name))
+        || (matches!(
+            query.as_str(),
+            "ring" | "rings" | "fused" | "fused ring" | "fused rings"
+        ) && matches!(
+            name,
+            "Naphthalene" | "Decalin" | "Indole" | "Quinoline" | "Anthracene" | "Phenanthrene"
+        ))
+        || (matches!(
+            query.as_str(),
+            "ring" | "rings" | "bridged" | "bridged ring" | "bridged rings"
+        ) && matches!(name, "Norbornane"))
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Language {
     English,
@@ -63,6 +119,120 @@ fn recent_files_path() -> PathBuf {
         .parent()
         .unwrap_or(Path::new("."))
         .join("recent-files.txt")
+}
+fn user_templates_path() -> PathBuf {
+    settings_path()
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("templates")
+}
+#[derive(Clone)]
+struct UserTemplate {
+    name: String,
+    mol: Molecule,
+    path: PathBuf,
+}
+fn template_slug(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > 48
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == ' ' || ch == '-' || ch == '_')
+    {
+        return Err("Use 1–48 letters, numbers, spaces, hyphens or underscores".into());
+    }
+    let slug = name
+        .chars()
+        .filter(|ch| *ch != ' ')
+        .map(|ch| match ch {
+            '_' => '-',
+            value => value.to_ascii_lowercase(),
+        })
+        .collect::<String>();
+    if slug.is_empty() {
+        Err("Template name must contain a letter or number".into())
+    } else {
+        Ok(slug)
+    }
+}
+fn save_user_template_to(
+    directory: &Path,
+    name: &str,
+    mol: &Molecule,
+) -> Result<UserTemplate, String> {
+    if mol.atoms.is_empty() || mol.atoms.len() > 200 || mol.bonds.len() > 400 {
+        return Err("A user template must contain 1–200 atoms and no more than 400 bonds".into());
+    }
+    if mol
+        .bonds
+        .iter()
+        .any(|bond| bond.a >= mol.atoms.len() || bond.b >= mol.atoms.len() || bond.a == bond.b)
+    {
+        return Err("A user template contains an invalid bond reference".into());
+    }
+    let name = name.trim();
+    let slug = template_slug(name)?;
+    let path = directory.join(format!("{slug}.mols"));
+    if path.exists() {
+        return Err(format!("A template named ‘{name}’ already exists"));
+    }
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let mut stored = mol.clone();
+    stored.name = name.into();
+    let encoded = native::write(&Snapshot {
+        mol: stored.clone(),
+        graphics: Vec::new(),
+    });
+    let temporary = directory.join(format!(".{slug}-{}.tmp", std::process::id()));
+    let result = fs::write(&temporary, encoded)
+        .and_then(|()| fs::rename(&temporary, &path))
+        .map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            error.to_string()
+        });
+    result?;
+    Ok(UserTemplate {
+        name: name.into(),
+        mol: stored,
+        path,
+    })
+}
+fn load_user_templates_from(directory: &Path) -> Result<Vec<UserTemplate>, String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut templates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("mols") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let snapshot = native::read(&text)
+            .map_err(|error| format!("Could not load user template {}: {error}", path.display()))?;
+        if snapshot.mol.name.trim().is_empty()
+            || snapshot.mol.atoms.is_empty()
+            || snapshot.mol.atoms.len() > 200
+            || snapshot.mol.bonds.len() > 400
+            || molecule_components(&snapshot.mol).len() != 1
+        {
+            return Err(format!("Invalid user template file: {}", path.display()));
+        }
+        templates.push(UserTemplate {
+            name: snapshot.mol.name.clone(),
+            mol: snapshot.mol,
+            path,
+        });
+        if templates.len() > 200 {
+            return Err("The user template library exceeds 200 entries".into());
+        }
+    }
+    templates.sort_by_key(|template| template.name.to_lowercase());
+    Ok(templates)
 }
 fn load_recent_files() -> Vec<String> {
     fs::read_to_string(recent_files_path())
@@ -109,6 +279,74 @@ fn load_dark_theme() -> bool {
         .map(|s| s.lines().any(|line| line.trim() == "theme=dark"))
         .unwrap_or(false)
 }
+fn load_implicit_hydrogen_visibility() -> bool {
+    load_implicit_hydrogen_visibility_from(&settings_path())
+}
+fn load_implicit_hydrogen_visibility_from(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|settings| {
+            settings
+                .lines()
+                .any(|line| line.trim() == "show_implicit_hydrogens=true")
+        })
+        .unwrap_or(false)
+}
+fn save_implicit_hydrogen_visibility(show: bool) -> std::io::Result<()> {
+    save_implicit_hydrogen_visibility_to(&settings_path(), show)
+}
+fn save_implicit_hydrogen_visibility_to(path: &Path, show: bool) -> std::io::Result<()> {
+    save_setting(
+        path,
+        "show_implicit_hydrogens",
+        if show { "true" } else { "false" },
+    )
+}
+fn load_3d_atom_symbols_visibility() -> bool {
+    load_3d_atom_symbols_visibility_from(&settings_path())
+}
+fn load_3d_atom_symbols_visibility_from(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|settings| {
+            !settings
+                .lines()
+                .any(|line| line.trim() == "show_3d_atom_symbols=false")
+        })
+        .unwrap_or(true)
+}
+fn save_3d_atom_symbols_visibility(show: bool) -> std::io::Result<()> {
+    save_3d_atom_symbols_visibility_to(&settings_path(), show)
+}
+fn save_3d_atom_symbols_visibility_to(path: &Path, show: bool) -> std::io::Result<()> {
+    save_setting(
+        path,
+        "show_3d_atom_symbols",
+        if show { "true" } else { "false" },
+    )
+}
+fn load_zoom_preference() -> f32 {
+    load_zoom_preference_from(&settings_path())
+}
+fn load_zoom_preference_from(path: &Path) -> f32 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|settings| {
+            settings
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("zoom=")?.parse::<f32>().ok())
+        })
+        .filter(|zoom| zoom.is_finite())
+        .unwrap_or(1.)
+        .clamp(0.2, 4.0)
+}
+fn save_zoom_preference_to(path: &Path, zoom: f32) -> std::io::Result<()> {
+    if !zoom.is_finite() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Zoom preference must be finite",
+        ));
+    }
+    save_setting(path, "zoom", &format!("{:.4}", zoom.clamp(0.2, 4.0)))
+}
 fn save_dark_theme(dark: bool) -> std::io::Result<()> {
     save_setting(
         &settings_path(),
@@ -121,26 +359,12 @@ fn save_setting(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let old = fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<&str> = old
+    let mut lines: Vec<String> = old
         .lines()
         .filter(|line| !line.trim().starts_with(&format!("{key}=")))
+        .map(str::to_string)
         .collect();
-    lines.push(match key {
-        "language" => {
-            if value == "da" {
-                "language=da"
-            } else {
-                "language=en"
-            }
-        }
-        _ => {
-            if value == "dark" {
-                "theme=dark"
-            } else {
-                "theme=light"
-            }
-        }
-    });
+    lines.push(format!("{key}={value}"));
     fs::write(path, format!("{}\n", lines.join("\n")))
 }
 fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
@@ -190,6 +414,9 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Validate" => "Kontrollér struktur",
         "Find substructure matches" => "Find delstrukturmatch",
         "Name structure" => "Navngiv struktur",
+        "Auto-map reaction (Complete)" => "Automatisk atomkortlægning (Komplet)",
+        "Auto-map reaction (Matching)" => "Automatisk atomkortlægning (Matchende)",
+        "Auto-map reaction (Changing)" => "Automatisk atomkortlægning (Ændringer)",
         "Clean 2D" => "Ryd op i 2D",
         "Add explicit hydrogens" => "Tilføj eksplicitte hydrogenatomer",
         "Remove explicit hydrogens" => "Fjern eksplicitte hydrogenatomer",
@@ -201,11 +428,72 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Benzene template" => "Benzen-skabelon",
         "Formula & mass" => "Formel og masse",
         "Molecular properties" => "Molekyleegenskaber",
+        "Chemistry A acid/base tools" => "Kemi A: syre-baseværktøjer",
+        "Chemistry A acid-base workbench" => "Kemi A: syre-baseberegner",
+        "Buffer pH from pKa" => "Buffer-pH ud fra pKa",
+        "pKa from buffer measurements" => "pKa ud fra buffermåling",
+        "Weak-acid pH" => "pH for svag syre",
+        "Weak-base pH" => "pH for svag base",
+        "Strong acid/base mixture pH" => "pH for blanding af stærk syre/base",
+        "Polyprotic speciation" => "Speciering af polyprot syre",
+        "Bjerrum diagram data" => "Bjerrumdiagram-data",
+        "Polyprotic titration pH" => "pH ved polyprot titrering",
+        "Polyprotic titration curve" => "Polyprot titrerkurve",
+        "Bjerrum diagram · species distribution" => "Bjerrumdiagram · artsfordeling",
+        "Fraction (%)" => "Andel (%)",
+        "Added strong base (mL)" => "Tilsat stærk base (mL)",
+        "Polyprotic acid · titration curve" => "Polyprot syre · titrerkurve",
+        "Copy CSV data" => "Kopiér CSV-data",
+        "Choose a calculation, then enter values in the order shown. Use ; between fields and | between successive pKa values." => "Vælg en beregning, og indtast værdierne i den viste rækkefølge. Brug ; mellem felter og | mellem successive pKa-værdier.",
+        "Henderson–Hasselbalch: pH = pKa + log₁₀([A⁻]/[HA]). Charts can copy data as CSV." => "Henderson–Hasselbalch: pH = pKa + log₁₀([A⁻]/[HA]). Diagramdata kan kopieres som CSV.",
+        "Enter values separated by semicolons. Decimal comma or point is accepted." => "Angiv værdier adskilt af semikolon. Decimal-komma eller punktum accepteres.",
+        "Example: 4.76; 0.10; 0.20" => "Eksempel: 4,76; 0,10; 0,20",
+        "Example: 5.06; 0.10; 0.20" => "Eksempel: 5,06; 0,10; 0,20",
+        "Example: 4.76; 0.10" => "Eksempel: 4,76; 0,10",
+        "Example: 9.25; 0.10" => "Eksempel: 9,25; 0,10",
+        "Example: 0.10; 0.05" => "Eksempel: 0,10; 0,05",
+        "Example: 2.15|7.20|12.35; 7.00" => "Eksempel: 2,15|7,20|12,35; 7,00",
+        "Example: 2.15|7.20; 0; 14; 0.5" => "Eksempel: 2,15|7,20; 0; 14; 0,5",
+        "Example: 4.76; 25; 0.10; 0.10; 12.5" => "Eksempel: 4,76; 25; 0,10; 0,10; 12,5",
+        "Example: 4.76; 25; 0.10; 0.10; 1.5" => "Eksempel: 4,76; 25; 0,10; 0,10; 1,5",
+        "pKa values (in increasing order) separated by |; then pH" => "pKa-værdier i stigende rækkefølge adskilt af |; derefter pH",
+        "pKa values separated by |; pH minimum; maximum; step" => "pKa-værdier adskilt af |; pH minimum; maksimum; trin",
+        "pKa values separated by |; acid volume mL; acid M; base M; added base volume mL" => "pKa-værdier adskilt af |; syrevolumen mL; syre M; base M; tilsat basevolumen mL",
+        "pKa values separated by |; acid volume mL; acid M; base M; max equivalents" => "pKa-værdier adskilt af |; syrevolumen mL; syre M; base M; maks. ækvivalenter",
+        "Buffer pH (pKa; acid M; conjugate base M)" => "Buffer-pH (pKa; syre M; korresponderende base M)",
+        "Measured pH; acid M; conjugate base M" => "Målt pH; syre M; korresponderende base M",
+        "pKa of conjugate acid; total base concentration M" => "pKa for korresponderende syre; total basekoncentration M",
+        "Final strong-acid concentration M; final strong-base concentration M" => "Slutkoncentration af stærk syre M; slutkoncentration af stærk base M",
+        "pKa; weak-acid concentration M" => "pKa; koncentration af svag syre M",
+        "pKa is entered from your class data or a cited table. No structure-based pKa prediction is made." => "pKa indtastes fra undervisningsdata eller en kilde. Der beregnes ikke pKa ud fra strukturen.",
+        "Local topological descriptors" => "Lokale topologiske deskriptorer",
+        "Edit molecule data" => "Redigér molekyldata",
+        "Copy as SMILES" => "Kopiér som SMILES",
+        "Copy as SMARTS" => "Kopiér som SMARTS",
+        "Copy drawing as image" => "Kopiér tegning som billede",
+        "Show implicit hydrogens" => "Vis implicitte hydrogenatomer",
+        "Implicit hydrogen labels" => "Visning af implicitte hydrogenatomer",
+        "Shown" => "Vises",
+        "Hidden" => "Skjult",
+        "Interface language" => "Sprog i brugerfladen",
+        "Appearance" => "Udseende",
+        "Language and appearance are saved automatically." => "Sprog og udseende gemmes automatisk.",
+        "KEY=VALUE saves or updates · -KEY removes · NAME sets molecule name" => "KEY=VALUE gemmer eller opdaterer · -KEY fjerner · NAME angiver molekylenavn",
         "Reaction analysis" => "Reaktionsanalyse",
+        "Reaction coefficient: custom" => "Reaktionskoefficient: brugerdefineret",
+        "Gasteiger partial charges" => "Gasteiger-partialladninger",
+        "Set a whole-number coefficient from 1 to 99 for this component." => "Angiv en heltalskoefficient fra 1 til 99 for denne komponent.",
         "Auto-balance reaction" => "Afstem reaktion automatisk",
+        "Auto-balance all reaction steps" => "Afstem alle reaktionstrin automatisk",
+        "View previous reaction step" => "Vis forrige reaktionstrin",
+        "View next reaction step" => "Vis næste reaktionstrin",
+        "View all reaction steps" => "Vis alle reaktionstrin",
         "RDKit descriptors" => "RDKit-deskriptorer",
         "Enumerate tautomers" => "Enumerér tautomere former",
         "Enumerate stereoisomers" => "Enumerér stereoisomerer",
+        "Fetch PubChem properties" => "Hent PubChem-data",
+        "Search PubChem in browser" => "Søg i PubChem i browseren",
+        "Assign R/S labels with RDKit" => "Tildel R/S-labels med RDKit",
         "Integration status" => "Integrationsstatus",
         "Quick start guide" => "Hurtig vejledning",
         "Shortcuts" => "Tastaturgenveje",
@@ -226,12 +514,13 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Select and drag atoms or graphic objects (Esc)" => "Vælg, eller træk atomer og grafiske objekter (Esc)",
         "Delete one atom, bond or object (E)" => "Slet et atom, en binding eller et objekt (E)",
         "Draw a single bond (1)" => "Tegn en enkeltbinding (1)",
-        "Draw a double bond (2)" => "Tegn en dobbeltbinding (2)",
+        "Draw or change a bond to a double bond (2)" => "Tegn eller ændr en binding til en dobbeltbinding (2)",
         "Draw a triple bond (3)" => "Tegn en tripelbinding (3)",
         "Draw an aromatic bond (4)" => "Tegn en aromatisk binding (4)",
         "Draw a filled wedge (5)" => "Tegn en fyldt kile (5)",
         "Draw a hashed wedge (6)" => "Tegn en stiplet kile (6)",
         "Draw an unspecified stereo bond (7)" => "Tegn en binding med uspecificeret stereokemi (7)",
+        "Changed existing bond to a double bond" => "Ændrede den eksisterende binding til en dobbeltbinding",
         "Place or replace an atom (element symbol)" => "Placér eller udskift et atom (grundstofsymbol)",
         "Draw a zigzag carbon chain (drag between endpoints)" => "Tegn en zigzag-kæde af kulstof (træk mellem endepunkter)",
         "Place a six-membered ring (Shift+R)" => "Placér en seksleddet ring (Shift+R)",
@@ -250,10 +539,13 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "MOLECULA · QUICK START" => "MOLECULA · HURTIG VEJLEDNING",
         "01  DRAW" => "01  TEGN",
         "Choose a bond on the left, then drag or click two points. Choose Chain near the top of the tools to draw a zigzag carbon chain." => "Vælg en binding til venstre, og træk eller klik på to punkter. Vælg Kæde for at tegne en zigzag-kæde af kulstof.",
+        "To change an existing bond, choose Double (=) and click its middle. Undo reverses the change." => "Hvis du vil ændre en binding, vælg Dobbeltbinding (=), og klik midt på bindingen. Fortryd ruller ændringen tilbage.",
         "02  CHANGE ATOMS" => "02  SKIFT ATOMER",
         "Choose C, N, O or another element below. Click an atom to replace it. Use the periodic table for all elements." => "Vælg C, N, O eller et andet grundstof nedenfor. Klik på et atom for at udskifte det. Brug periodesystemet til alle grundstoffer.",
+        "With an atom selected, type @ followed by a mass number (for example @13); @0 clears the isotope. Type label:Ph to show an alias; label:- clears it." => "Når et atom er valgt, skriv @ efterfulgt af et massetal (fx @13); @0 fjerner isotopen. Skriv label:Ph for at vise et alias; label:- fjerner det.",
         "03  BUILD A REACTION" => "03  BYG EN REAKTION",
         "Place reactants left and products right. Insert → Arrow draws a reaction arrow. Use Calculations → Reaction analysis when you want formula, molar mass and balance. Use e⁻ tools for curved electron flow." => "Placér reaktanter til venstre og produkter til højre. Indsæt → Reaktionspil tegner en pil. Brug Beregninger → Reaktionsanalyse til formel, molmasse og balance. Brug e⁻-værktøjerne til buet elektronbevægelse.",
+        "Automatic mapping: select every complete reactant and product component in one step; leave agents unselected, assign explicit roles, then choose Structure → Auto-map reaction. Requires optional AtomMapper + RDKit." => "Automatisk kortlægning: markér alle hele reaktant- og produktkomponenter i ét trin; lad agenter være umarkerede, angiv eksplicitte roller, og vælg derefter Struktur → Automatisk atomkortlægning. Kræver valgfri AtomMapper + RDKit.",
         "04  NAME AND CHECK" => "04  NAVNGIV OG KONTROLLÉR",
         "Structure → Name structure gives a name in the supported teaching subset. Molecular properties shows formula and mass." => "Struktur → Navngiv struktur giver et navn inden for det understøttede undervisningsområde. Molekyleegenskaber viser formel og masse.",
         "05  SAVE" => "05  GEM",
@@ -297,7 +589,6 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "TOOLS" => "VÆRKTØJER",
         "English" | "Dansk" => source,
         "Language" => "Sprog",
-        "Interface language" => "Grænsefladesprog",
         "Saved automatically" => "Gemmes automatisk",
         "New document" => "Nyt dokument",
         "Open MOL or MOLS" => "Åbn MOL eller MOLS",
@@ -328,15 +619,39 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Draw at least two atoms before cleaning" => "Tegn mindst to atomer før oprydning",
         "Cleaned 2D coordinates using a spring layout" => "Ryddede op i 2D-koordinater med fjederlayout",
         "MOL V2000 cannot store more than 999 atoms or bonds" => "MOL V2000 kan højst gemme 999 atomer eller bindinger",
-        "Unsupported extension. Use .mols, .mol, .sdf, .rxn, .smi, .svg, .png or .pdf" => "Filtypen understøttes ikke. Brug .mols, .mol, .sdf, .rxn, .smi, .svg, .png eller .pdf",
+        "Unsupported extension. Use .mols, .mol, .sdf, .rxn, .smi, .smarts, .svg, .png or .pdf" => "Filtypen understøttes ikke. Brug .mols, .mol, .sdf, .rxn, .smi, .smarts, .svg, .png eller .pdf",
         "Calculation finished" => "Beregning færdig",
         "Discarded calculation for an earlier molecule" => "Kasserede beregning for et tidligere molekyle",
         "Click the arrow end point, or drag from the start" => "Klik på pilens slutpunkt, eller træk fra startpunktet",
         "GRAPH" => "GRAF",
         "Clear iso" => "Fjern isotop",
+        "Query predicates" => "Søgekriterier",
+        "Aliphatic" => "Alifatisk",
+        "Unsaturated" => "Umættet",
+        "Any atom" => "Vilkårligt atom",
+        "Heteroatom" => "Heteroatom",
+        "Clear query" => "Fjern søgning",
+        "Radical" => "Radikal",
+        "Implicit H" => "Implicit H",
+        "Save selection as template" => "Gem markering som skabelon",
+        "Built-in" => "Indbyggede",
+        "My templates" => "Mine skabeloner",
+        "Save selected fragment" => "Gem markeret fragment",
+        "Previous" => "Forrige",
+        "Next" => "Næste",
+        "Confirm delete" => "Bekræft sletning",
+        "Name custom template" => "Navngiv skabelon",
+        "Rename custom template" => "Omdøb brugerdefineret skabelon",
+        "Rename" => "Omdøb",
+        "auto" => "automatisk",
+        "none" => "ingen",
+        "singlet" => "singlet",
+        "doublet" => "doublet",
+        "triplet" => "triplet",
         "Delete bond" => "Slet binding",
         "Order −" => "Orden −",
         "Order +" => "Orden +",
+        "Make double (=)" => "Gør til dobbeltbinding (=)",
         "E/Z applies to double bonds" => "E/Z gælder dobbeltbindinger",
         "Export" => "Eksportér",
         "Type: reaction" => "Type: reaktion",
@@ -349,11 +664,34 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Delete: delete selection | Esc: select tool | Shift+R: six-membered ring" => "Delete: slet markering | Esc: vælgerværktøj | Shift+R: seksleddet ring",
         "Drawing buffer: 1/2/3 orders, 4 aromatic, 5 wedge, 6 hash, 7 wavy" => "Tegneinput: 1/2/3 bindinger, 4 aromatisk, 5 kile, 6 stiplet, 7 bølget",
         "C, N, O, Cl... select element; + and - change selected charge" => "C, N, O, Cl... vælg grundstof; + og - ændrer ladningen",
-        "R1...R32767 assigns R-group; M1... assigns atom map" => "R1...R32767 angiver R-gruppe; M1... angiver atomkort",
+        "R1...R32767 assigns R-group; M1... assigns a map; M0 clears; M+/M= assign unique maps" => "R1...R32767 angiver R-gruppe; M1... angiver atomkort",
         "Ctrl+E opens the periodic table." => "Ctrl+E åbner periodesystemet.",
         _ => return localized_dynamic(source),
     };
     Cow::Borrowed(exact)
+}
+fn quick_start_guide(language: Language) -> String {
+    [
+        "MOLECULA · QUICK START",
+        "01  DRAW",
+        "Choose a bond on the left, then drag or click two points. Choose Chain near the top of the tools to draw a zigzag carbon chain.",
+        "To change an existing bond, choose Double (=) and click its middle. Undo reverses the change.",
+        "02  CHANGE ATOMS",
+        "Choose C, N, O or another element below. Click an atom to replace it. Use the periodic table for all elements.",
+        "With an atom selected, type @ followed by a mass number (for example @13); @0 clears the isotope. Type label:Ph to show an alias; label:- clears it.",
+        "03  BUILD A REACTION",
+        "Place reactants left and products right. Insert → Arrow draws a reaction arrow. Use Calculations → Reaction analysis when you want formula, molar mass and balance. Use e⁻ tools for curved electron flow.",
+        "Automatic mapping: select every complete reactant and product component in one step; leave agents unselected, assign explicit roles, then choose Structure → Auto-map reaction. Requires optional AtomMapper + RDKit.",
+        "04  NAME AND CHECK",
+        "Structure → Name structure gives a name in the supported teaching subset. Molecular properties shows formula and mass.",
+        "05  SAVE",
+        "File → Save writes a .mols document with editable chemistry and graphics.",
+        "UNDO Cmd/Ctrl+Z   ·   REDO Cmd/Ctrl+Y   ·   DELETE Delete   ·   CANCEL Esc",
+    ]
+    .into_iter()
+    .map(|line| localized(language, line).into_owned())
+    .collect::<Vec<_>>()
+    .join("\n\n")
 }
 fn localized_dynamic(source: &str) -> Cow<'_, str> {
     for (prefix, replacement) in [
@@ -862,13 +1200,27 @@ impl BondStyle {
     }
 }
 fn set_bond_order_value(bond: &mut Bond, order: u8) {
-    bond.order = order.clamp(1, 4);
+    let new_order = order.clamp(1, 4);
+    if bond.order != new_order || new_order != 2 {
+        bond.stereo = None;
+    }
+    bond.order = new_order;
     if bond.order == 4 {
         bond.style = BondStyle::Aromatic;
-    } else if bond.style == BondStyle::Aromatic
-        || (bond.order > 1 && bond.style != BondStyle::Normal)
-    {
+    } else {
         bond.style = BondStyle::Normal;
+    }
+    if let Some(query) = bond.query.as_deref() {
+        let retained: Vec<&str> = query
+            .split(';')
+            .filter(|term| {
+                !matches!(
+                    *term,
+                    "any" | "single-or-double" | "single-or-aromatic" | "double-or-aromatic"
+                )
+            })
+            .collect();
+        bond.query = (!retained.is_empty()).then(|| retained.join(";"));
     }
 }
 fn next_bond_style(style: BondStyle) -> BondStyle {
@@ -1012,6 +1364,268 @@ enum TextTarget {
     New(Vec2),
     ArrowAbove(usize),
     ArrowBelow(usize),
+    TemplateName,
+    RenameUserTemplate(usize),
+    MoleculeProperty,
+    ReactionCoefficient,
+    BufferPh,
+    PkaFromBuffer,
+    WeakAcidPh,
+    WeakBasePh,
+    StrongMixturePh,
+    PolyproticSpeciation,
+    BjerrumDiagram,
+    PolyproticTitrationPh,
+    PolyproticTitrationCurve,
+}
+fn acid_base_prompt(target: TextTarget) -> Option<&'static str> {
+    match target {
+        TextTarget::BufferPh => Some("Buffer pH (pKa; acid M; conjugate base M)"),
+        TextTarget::PkaFromBuffer => Some("Measured pH; acid M; conjugate base M"),
+        TextTarget::WeakAcidPh => Some("pKa; weak-acid concentration M"),
+        TextTarget::WeakBasePh => Some("pKa of conjugate acid; total base concentration M"),
+        TextTarget::StrongMixturePh => {
+            Some("Final strong-acid concentration M; final strong-base concentration M")
+        }
+        TextTarget::PolyproticSpeciation => {
+            Some("pKa values (in increasing order) separated by |; then pH")
+        }
+        TextTarget::BjerrumDiagram => Some("pKa values separated by |; pH minimum; maximum; step"),
+        TextTarget::PolyproticTitrationPh => {
+            Some("pKa values separated by |; acid volume mL; acid M; base M; added base volume mL")
+        }
+        TextTarget::PolyproticTitrationCurve => {
+            Some("pKa values separated by |; acid volume mL; acid M; base M; max equivalents")
+        }
+        _ => None,
+    }
+}
+fn acid_base_example(target: TextTarget) -> Option<&'static str> {
+    match target {
+        TextTarget::BufferPh => Some("Example: 4.76; 0.10; 0.20"),
+        TextTarget::PkaFromBuffer => Some("Example: 5.06; 0.10; 0.20"),
+        TextTarget::WeakAcidPh => Some("Example: 4.76; 0.10"),
+        TextTarget::WeakBasePh => Some("Example: 9.25; 0.10"),
+        TextTarget::StrongMixturePh => Some("Example: 0.10; 0.05"),
+        TextTarget::PolyproticSpeciation => Some("Example: 2.15|7.20|12.35; 7.00"),
+        TextTarget::BjerrumDiagram => Some("Example: 2.15|7.20; 0; 14; 0.5"),
+        TextTarget::PolyproticTitrationPh => Some("Example: 4.76; 25; 0.10; 0.10; 12.5"),
+        TextTarget::PolyproticTitrationCurve => Some("Example: 4.76; 25; 0.10; 0.10; 1.5"),
+        _ => None,
+    }
+}
+fn localize_acid_base_report(language: Language, report: String) -> String {
+    if language != Language::Danish {
+        return report;
+    }
+    [
+        ("Buffer pH =", "Buffer-pH ="),
+        ("Measured pH =", "Målt pH ="),
+        ("Weak-acid pH =", "pH for svag syre ="),
+        ("Weak-base pH =", "pH for svag base ="),
+        ("Strong acid/base mixture pH =", "pH for blanding af stærk syre/base ="),
+        ("Polyprotic acid speciation at pH", "Speciering af polyprot syre ved pH"),
+        ("Bjerrum distribution table", "Bjerrumdiagram: fordelingsdata"),
+        ("Titration pH =", "Titrerings-pH ="),
+        ("Titration curve points", "Titrerkurve: datapunkter"),
+        ("pKa values:", "pKa-værdier:"),
+        ("pKa =", "pKa ="),
+        ("Initial acid concentration", "Begyndelseskoncentration af syre"),
+        ("Initial concentration =", "Begyndelseskoncentration ="),
+        ("Initial base concentration =", "Begyndelseskoncentration af base ="),
+        ("pKa of BH⁺ =", "pKa for BH⁺ ="),
+        ("Initial acid:", "Startsyre:"),
+        ("Added strong base:", "Tilsat stærk base:"),
+        ("Final strong-acid concentration", "Slutkoncentration af stærk syre"),
+        ("Final strong-base concentration", "Slutkoncentration af stærk base"),
+        ("[HA] =", "[HA] ="),
+        ("[A⁻] =", "[A⁻] ="),
+        ("Method: Henderson–Hasselbalch, pH = pKa + log₁₀([A⁻]/[HA]). Aqueous ideal-solution calculation.", "Metode: Henderson–Hasselbalch, pH = pKa + log₁₀([A⁻]/[HA]). Ideel vandig opløsning."),
+        ("Method: rearranged Henderson–Hasselbalch. This derives a pKa from supplied measurement data; it is not a structure-based prediction.", "Metode: Henderson–Hasselbalch omskrevet til pKa. pKa udledes af de indtastede måledata og forudsiges ikke ud fra strukturen."),
+        ("Method: ideal aqueous monoprotic equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C.", "Metode: ideel vandig monoprotisk ligevægt løst ved ladningsbalance, inklusive vands autoprotolyse; Kw = 1,0×10⁻¹⁴ ved 25 °C."),
+        ("Method: ideal aqueous conjugate-acid equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C.", "Metode: ideel vandig ligevægt for den korresponderende syre løst ved ladningsbalance, inklusive vands autoprotolyse; Kw = 1,0×10⁻¹⁴ ved 25 °C."),
+        ("Method: neutralization and water ion balance, Kw = 1.0×10⁻¹⁴ at 25 °C. Enter concentrations after any volume change.", "Metode: neutralisation og ionbalance i vand, Kw = 1,0×10⁻¹⁴ ved 25 °C. Indtast koncentrationerne efter eventuel volumenændring."),
+        ("Method: successive ideal aqueous dissociation equilibria; fractions sum to 100%.", "Metode: successive ideelle vandige dissociationsligevægte; andelene summerer til 100 %."),
+        ("Method: polyprotic distribution plus electroneutrality after dilution; ideal aqueous conditions, 25 °C.", "Metode: polyprot fordeling og elektroneutralitet efter fortynding; ideelle vandige forhold ved 25 °C."),
+        ("Method: equilibrium charge balance for a polyprotic acid titrated with a strong base; ideal aqueous conditions, 25 °C.", "Metode: ladningsbalance i ligevægt for en polyprot syre titreret med en stærk base; ideelle vandige forhold ved 25 °C."),
+        ("Method:", "Metode:"),
+        ("Aqueous ideal-solution calculation.", "Beregning for en ideel vandig opløsning."),
+        ("at 25 °C.", "ved 25 °C."),
+        ("pH\t", "pH\t"),
+        ("α (%)", "α (%)"),
+        ("V(base), mL", "V(base), mL"),
+        ("Each α is the fraction of one successive protonation state. Ideal aqueous model; supplied pKa values are not predicted.", "Hver α er andelen af én protoneringstilstand. Ideel vandig model; indtastede pKa-værdier forudsiges ikke."),
+        ("Table values can be plotted externally.", "Værdierne vises også som diagram og kan kopieres som CSV."),
+    ]
+    .into_iter()
+    .fold(report, |text, (from, to)| text.replace(from, to))
+}
+fn valid_property_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+fn clipboard_candidates() -> Vec<(&'static str, &'static [&'static str])> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![("pbcopy", &[])]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        vec![("clip.exe", &[])]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        vec![
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    }
+}
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let candidates = clipboard_candidates();
+    let mut failure = String::new();
+    for (program, args) in candidates {
+        let child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            failure = format!("{program} is unavailable");
+            continue;
+        };
+        if let Some(mut input) = child.stdin.take() {
+            if let Err(error) = input.write_all(text.as_bytes()) {
+                drop(input);
+                let _ = child.wait();
+                failure = format!("Could not write to {program}: {error}");
+                continue;
+            }
+        }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => failure = format!("{program} could not access the system clipboard"),
+            Err(error) => failure = format!("Could not finish {program}: {error}"),
+        }
+    }
+    Err(if failure.is_empty() {
+        "No supported system clipboard command is available".into()
+    } else {
+        format!("Could not copy to clipboard: {failure}")
+    })
+}
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn process_failure(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("process exited with {}", output.status)
+}
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn write_clipboard_png(png: &[u8]) -> Result<PathBuf, String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "molecula-clipboard-{}-{nonce}.png",
+        std::process::id()
+    ));
+    fs::write(&path, png).map_err(|error| format!("Could not stage PNG for clipboard: {error}"))?;
+    Ok(path)
+}
+fn copy_png_to_clipboard(png: &[u8]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = write_clipboard_png(png)?;
+        let script = "on run argv\n set the clipboard to (read (POSIX file (item 1 of argv)) as «class PNGf»)\nend run";
+        let result = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("Could not start osascript: {error}"))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(process_failure(&output))
+                }
+            });
+        let _ = fs::remove_file(path);
+        return result;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let path = write_clipboard_png(png)?;
+        let script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $ErrorActionPreference = 'Stop'; $image = [System.Drawing.Image]::FromFile($env:MOLECULA_CLIPBOARD_PNG); try { [System.Windows.Forms.Clipboard]::SetImage($image) } finally { $image.Dispose() }";
+        let result = Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .env("MOLECULA_CLIPBOARD_PNG", &path)
+            .output()
+            .map_err(|error| format!("Could not start PowerShell: {error}"))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(process_failure(&output))
+                }
+            });
+        let _ = fs::remove_file(path);
+        return result;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut failure = String::new();
+        for (program, args) in [
+            ("wl-copy", &(["--type", "image/png"][..])),
+            (
+                "xclip",
+                &(["-selection", "clipboard", "-t", "image/png", "-i"][..]),
+            ),
+        ] {
+            let child = Command::new(program)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let Ok(mut child) = child else {
+                failure = format!("{program} is unavailable");
+                continue;
+            };
+            if let Some(mut input) = child.stdin.take() {
+                if let Err(error) = input.write_all(png) {
+                    drop(input);
+                    let _ = child.wait();
+                    failure = format!("Could not write PNG to {program}: {error}");
+                    continue;
+                }
+            }
+            match child.wait() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(_) => failure = format!("{program} could not access the image clipboard"),
+                Err(error) => failure = format!("Could not finish {program}: {error}"),
+            }
+        }
+        return Err(if failure.is_empty() {
+            "No supported image clipboard command is available".into()
+        } else {
+            format!("Could not copy image to clipboard: {failure}")
+        });
+    }
+    #[allow(unreachable_code)]
+    Err("Image clipboard is unavailable on this platform".into())
 }
 enum LessonContent {
     Naming { name: String, steps: Vec<String> },
@@ -1020,6 +1634,30 @@ enum LessonContent {
 struct TeachingLesson {
     content: LessonContent,
     step: usize,
+}
+#[derive(Clone)]
+struct ChemistryChart {
+    title: String,
+    x_label: String,
+    y_label: String,
+    series: Vec<String>,
+    points: Vec<(f64, Vec<f64>)>,
+}
+fn chemistry_chart_csv(chart: &ChemistryChart) -> String {
+    let mut csv = chart.x_label.clone();
+    for label in &chart.series {
+        csv.push(',');
+        csv.push_str(label);
+    }
+    csv.push('\n');
+    for (x, values) in &chart.points {
+        csv.push_str(&format!("{x:.6}"));
+        for value in values {
+            csv.push_str(&format!(",{value:.8}"));
+        }
+        csv.push('\n');
+    }
+    csv
 }
 struct Editor {
     mol: Molecule,
@@ -1046,6 +1684,8 @@ struct Editor {
     selected_bonds: Vec<usize>,
     selected_graphics: Vec<usize>,
     zoom: f32,
+    preferred_zoom: f32,
+    zoom_preference_dirty: bool,
     pan: Vec2,
     panning: bool,
     naming_highlight: Vec<usize>,
@@ -1054,6 +1694,7 @@ struct Editor {
     view_3d_open: bool,
     rotation_3d: Vec2,
     zoom_3d: f32,
+    show_3d_atom_symbols: bool,
     last_3d_pointer: Option<Vec2>,
     view_3d_style: u8,
     drag_start: Option<Vec2>,
@@ -1067,6 +1708,14 @@ struct Editor {
     periodic_open: bool,
     templates_open: bool,
     template_query: String,
+    user_templates: Vec<UserTemplate>,
+    template_tab_custom: bool,
+    template_page: usize,
+    template_rotation: u16,
+    template_preview: Option<Molecule>,
+    template_attachment_target: Option<usize>,
+    pending_delete_template: Option<usize>,
+    pending_custom_template: Option<Molecule>,
     text_target: Option<TextTarget>,
     text_buffer: String,
     bond_query: Option<String>,
@@ -1075,17 +1724,32 @@ struct Editor {
     palette_query: String,
     palette_selection: usize,
     info_overlay: Option<String>,
+    acid_base_open: bool,
+    acid_base_chart: Option<ChemistryChart>,
     info_scroll: usize,
     lesson: Option<TeachingLesson>,
     lesson_open: bool,
     settings_open: bool,
     language: Language,
     dark_theme: bool,
+    show_implicit_hydrogens: bool,
     arrow_kind: String,
     pending_arrow: Option<Vec2>,
     calc_rx: Option<(Molecule, Receiver<Result<String, String>>)>,
+    auto_map_pending: Option<(Vec<usize>, Vec<usize>, String)>,
 }
 impl Editor {
+    fn refuse_overlapping_worker(&mut self) -> bool {
+        if self.calc_rx.is_some() {
+            self.status =
+                "Wait for the current background chemistry job to finish before starting another."
+                    .into();
+            true
+        } else {
+            false
+        }
+    }
+
     fn set_language(&mut self, language: Language) {
         self.language = language;
         UI_LANGUAGE.with(|current| current.set(language));
@@ -1100,6 +1764,37 @@ impl Editor {
         self.status = match save_dark_theme(dark) {
             Ok(()) => "Appearance saved".into(),
             Err(_) => "Could not save appearance preference".into(),
+        };
+    }
+    fn persist_zoom_preference(&mut self) {
+        self.persist_zoom_preference_to(&settings_path());
+    }
+    fn persist_zoom_preference_to(&mut self, path: &Path) {
+        if !self.zoom_preference_dirty {
+            return;
+        }
+        self.zoom_preference_dirty = false;
+        if save_zoom_preference_to(path, self.preferred_zoom).is_err() {
+            self.status = "Could not save zoom preference".into();
+        }
+    }
+    fn set_implicit_hydrogen_visibility(&mut self, show: bool) {
+        self.show_implicit_hydrogens = show;
+        self.status = match save_implicit_hydrogen_visibility(show) {
+            Ok(()) => "Hydrogen display preference saved".into(),
+            Err(_) => "Could not save hydrogen display preference".into(),
+        };
+    }
+    fn toggle_3d_atom_symbols(&mut self) {
+        self.show_3d_atom_symbols = !self.show_3d_atom_symbols;
+        let visible = if self.show_3d_atom_symbols {
+            "3D atom symbols shown"
+        } else {
+            "3D atom symbols hidden"
+        };
+        self.status = match save_3d_atom_symbols_visibility(self.show_3d_atom_symbols) {
+            Ok(()) => visible.into(),
+            Err(error) => format!("{visible}, but the preference could not be saved: {error}"),
         };
     }
     fn finish_arrow(&mut self, p: Vec2) {
@@ -1135,6 +1830,12 @@ impl Editor {
         }
     }
     fn new() -> Self {
+        let preferred_zoom = load_zoom_preference();
+        let (user_templates, template_load_error) =
+            match load_user_templates_from(&user_templates_path()) {
+                Ok(templates) => (templates, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
         let mut editor = Self {
             mol: Molecule::default(),
             graphics: vec![],
@@ -1159,7 +1860,9 @@ impl Editor {
             selected_graphic: None,
             selected_bonds: Vec::new(),
             selected_graphics: Vec::new(),
-            zoom: 1.,
+            zoom: preferred_zoom,
+            preferred_zoom,
+            zoom_preference_dirty: false,
             pan: vec2(0., 0.),
             panning: false,
             naming_highlight: Vec::new(),
@@ -1168,6 +1871,7 @@ impl Editor {
             view_3d_open: false,
             rotation_3d: Vec2::ZERO,
             zoom_3d: 1.,
+            show_3d_atom_symbols: load_3d_atom_symbols_visibility(),
             last_3d_pointer: None,
             view_3d_style: 1,
             drag_start: None,
@@ -1184,6 +1888,14 @@ impl Editor {
             periodic_open: false,
             templates_open: false,
             template_query: String::new(),
+            user_templates,
+            template_tab_custom: false,
+            template_page: 0,
+            template_rotation: 0,
+            template_preview: None,
+            template_attachment_target: None,
+            pending_delete_template: None,
+            pending_custom_template: None,
             text_target: None,
             text_buffer: String::new(),
             bond_query: None,
@@ -1192,16 +1904,23 @@ impl Editor {
             palette_query: String::new(),
             palette_selection: 0,
             info_overlay: None,
+            acid_base_open: false,
+            acid_base_chart: None,
             info_scroll: 0,
             lesson: None,
             lesson_open: false,
             settings_open: false,
             language: load_language(),
             dark_theme: load_dark_theme(),
+            show_implicit_hydrogens: load_implicit_hydrogen_visibility(),
             arrow_kind: "reaction".into(),
             pending_arrow: None,
             calc_rx: None,
+            auto_map_pending: None,
         };
+        if let Some(error) = template_load_error {
+            editor.status = format!("Could not load custom templates: {error}");
+        }
         editor.restore_autosave();
         editor
     }
@@ -1219,6 +1938,8 @@ impl Editor {
     fn adjust_zoom(&mut self, delta: f32, anchor: Vec2, w: f32, h: f32) {
         let before = self.to_world(anchor, w, h);
         self.zoom = (self.zoom * delta).clamp(0.2, 4.0);
+        self.preferred_zoom = self.zoom;
+        self.zoom_preference_dirty = true;
         let origin = Self::view_origin(w, h);
         self.pan = anchor - origin - (before - origin) * self.zoom;
         self.pan.x = self.pan.x.clamp(-w * 2., w * 2.);
@@ -1572,6 +2293,52 @@ impl Editor {
         }
         self.status = "Updated reaction component metadata".into();
     }
+    fn assign_unique_atom_maps(&mut self) {
+        let mut targets = self.selected_atoms.clone();
+        if let Some(atom) = self.selected {
+            targets.push(atom);
+        }
+        targets.retain(|&index| index < self.mol.atoms.len());
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            targets.extend(0..self.mol.atoms.len());
+        }
+        if targets.is_empty() {
+            self.status = "Draw or select atoms before assigning map numbers".into();
+            return;
+        }
+        let target_set: BTreeSet<usize> = targets.iter().copied().collect();
+        let used: BTreeSet<u16> = self
+            .mol
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !target_set.contains(index))
+            .filter_map(|(_, atom)| atom.atom_map)
+            .collect();
+        let assignments: Vec<u16> = (1..=32_767)
+            .filter(|number| !used.contains(number))
+            .take(targets.len())
+            .collect();
+        if assignments.len() != targets.len() {
+            self.status = "No free atom-map numbers remain in the supported range 1–32767".into();
+            return;
+        }
+        if targets
+            .iter()
+            .zip(&assignments)
+            .all(|(&index, &number)| self.mol.atoms[index].atom_map == Some(number))
+        {
+            self.status = "Selected atoms already have these unique map numbers".into();
+            return;
+        }
+        self.checkpoint();
+        for (index, number) in targets.into_iter().zip(assignments) {
+            self.mol.atoms[index].atom_map = Some(number);
+        }
+        self.status = "Assigned unique atom-map numbers; undo restores previous maps".into();
+    }
     fn duplicate_selection(&mut self) {
         if !self.has_selection() {
             self.status = "Select atoms, bonds or objects to duplicate".into();
@@ -1795,7 +2562,7 @@ impl Editor {
         self.undo = undo;
         self.redo = redo;
         self.clear_selection();
-        self.zoom = 1.;
+        self.zoom = self.preferred_zoom;
         self.pan = Vec2::ZERO;
         self.status = format!("Opened tab: {title}");
     }
@@ -1833,7 +2600,7 @@ impl Editor {
         self.undo = doc.undo.clone();
         self.redo = doc.redo.clone();
         self.clear_selection();
-        self.zoom = 1.;
+        self.zoom = self.preferred_zoom;
         self.pan = Vec2::ZERO;
         self.pending_close = None;
         self.status = "Closed document tab".into();
@@ -1875,7 +2642,17 @@ impl Editor {
     }
     fn analyze_reaction(&mut self) {
         match reaction::analyze_all(&self.mol, &self.graphics) {
-            Ok(reports) => {
+            Ok(mut reports) => {
+                if let Some(step) = self.reaction_step_view {
+                    reports.retain(|report| report.step == step);
+                    if reports.is_empty() {
+                        self.reaction_highlight_bonds.clear();
+                        self.info_overlay = Some(format!(
+                            "Reaction step {step} does not exist. Draw another reaction arrow or show all steps."
+                        ));
+                        return;
+                    }
+                }
                 let pairs: std::collections::BTreeSet<(u16, u16)> = reports
                     .iter()
                     .flat_map(|r| r.changed_map_pairs.iter().copied())
@@ -1943,6 +2720,71 @@ impl Editor {
             }
         }
     }
+    fn auto_balance_all_reactions(&mut self) {
+        let step_count = self
+            .graphics
+            .iter()
+            .filter(|graphic| matches!(graphic, Graphic::Arrow { kind, .. } if matches!(kind.as_str(), "reaction" | "equilibrium" | "retrosynthesis")))
+            .count();
+        if step_count == 0 {
+            self.info_overlay =
+                Some("Draw at least one reaction arrow before balancing all steps.".into());
+            return;
+        }
+
+        // Solve every step before editing anything. If one step is ambiguous or
+        // incomplete, preserve all current coefficients and explain the step.
+        let mut by_step = Vec::with_capacity(step_count);
+        for step in 1..=step_count {
+            match reaction::propose_balancing_coefficients(&self.mol, &self.graphics, step as u16) {
+                Ok(proposals) => by_step.push((step, proposals)),
+                Err(error) => {
+                    self.info_overlay = Some(format!(
+                        "No coefficients were changed. Reaction step {step} could not be uniquely balanced.\n\n{error}"
+                    ));
+                    return;
+                }
+            }
+        }
+
+        let has_changes = by_step.iter().any(|(_, proposals)| {
+            proposals.iter().any(|proposal| {
+                proposal.atom_indices.iter().any(|&index| {
+                    self.mol
+                        .atoms
+                        .get(index)
+                        .is_some_and(|atom| atom.coefficient != proposal.coefficient)
+                })
+            })
+        });
+        if !has_changes {
+            self.status =
+                "All reaction steps already have the smallest balanced coefficients".into();
+            return;
+        }
+
+        self.checkpoint();
+        let mut lines = vec![format!(
+            "Balanced all {step_count} reaction steps by elements and formal charge:"
+        )];
+        for (step, proposals) in by_step {
+            lines.push(format!("\nStep {step}"));
+            for proposal in proposals {
+                for &index in &proposal.atom_indices {
+                    if let Some(atom) = self.mol.atoms.get_mut(index) {
+                        atom.coefficient = proposal.coefficient;
+                    }
+                }
+                lines.push(format!(
+                    "{}: coefficient {}",
+                    proposal.formula, proposal.coefficient
+                ));
+            }
+        }
+        self.info_scroll = 0;
+        self.info_overlay = Some(lines.join("\n"));
+        self.status = format!("Balanced all {step_count} reaction steps");
+    }
     fn start_naming_lesson(&mut self) {
         match naming::name(&self.mol) {
             Ok(result) => {
@@ -1961,6 +2803,9 @@ impl Editor {
         self.lesson_open = true;
     }
     fn start_rdkit_graph_operation(&mut self, operation: &'static str) {
+        if self.refuse_overlapping_worker() {
+            return;
+        }
         if self.mol.atoms.is_empty() {
             self.info_overlay = Some("Draw a structure first".into());
             return;
@@ -2005,6 +2850,74 @@ impl Editor {
         self.status = format!("Running optional RDKit {operation} operation…");
     }
     fn start_stereo_report(&mut self) {
+        self.start_stereo_check(false);
+    }
+    fn start_stereo_assignment(&mut self) {
+        self.start_stereo_check(true);
+    }
+    fn start_copy_smiles(&mut self) {
+        if self.refuse_overlapping_worker() {
+            return;
+        }
+        if self.mol.atoms.is_empty() {
+            self.info_overlay = Some("Draw or open a molecule before copying SMILES".into());
+            return;
+        }
+        if self.mol.atoms.iter().any(|atom| {
+            atom.alias.is_some()
+                || atom.r_group.is_some()
+                || atom.query.is_some()
+                || !chemistry::valid_element(&atom.element)
+        }) || self.mol.bonds.iter().any(|bond| {
+            bond.query.is_some()
+                || matches!(
+                    bond.style,
+                    BondStyle::Coordinate | BondStyle::Any | BondStyle::Wavy
+                )
+        }) {
+            self.info_overlay = Some(
+                "This structure contains aliases, query features or nonstandard bonds that cannot be represented safely in SMILES. The clipboard was left unchanged.".into(),
+            );
+            return;
+        }
+        let block = self.molfile();
+        let captured = self.mol.clone();
+        let smiles_molecule = captured.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = smiles::export(&smiles_molecule)
+                .or_else(|_| rdkit::to_smiles_with_stereo(&block, &smiles_molecule))
+                .and_then(|smiles| {
+                    copy_text_to_clipboard(&smiles)?;
+                    Ok(format!("COPIED_SMILES\n{smiles}"))
+                });
+            let _ = tx.send(result);
+        });
+        self.calc_rx = Some((captured, rx));
+        self.status =
+            "Creating SMILES locally when supported (optional RDKit fallback otherwise)…".into();
+    }
+    fn start_copy_smarts(&mut self) {
+        match smarts::export(&self.mol) {
+            Ok(pattern) => match copy_text_to_clipboard(&pattern) {
+                Ok(()) => {
+                    self.info_overlay = Some(format!(
+                        "SMARTS copied (supported local subset)\n\n{pattern}\n\nMolecule metadata and drawing objects are not part of SMARTS."
+                    ));
+                }
+                Err(error) => self.info_overlay = Some(error),
+            },
+            Err(error) => {
+                self.info_overlay = Some(format!(
+                    "SMARTS export unavailable for this structure\n{error}\n\nThe clipboard was left unchanged."
+                ));
+            }
+        }
+    }
+    fn start_stereo_check(&mut self, apply_labels: bool) {
+        if self.refuse_overlapping_worker() {
+            return;
+        }
         if self.mol.atoms.is_empty() {
             self.info_overlay = Some("Draw a structure first".into());
             return;
@@ -2026,12 +2939,80 @@ impl Editor {
         let captured = self.mol.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(rdkit::stereo_report(&block));
+            let result = rdkit::stereo_report(&block).map(|report| {
+                if apply_labels {
+                    format!("ASSIGN_STEREO\n{report}")
+                } else {
+                    report
+                }
+            });
+            let _ = tx.send(result);
         });
         self.calc_rx = Some((captured, rx));
-        self.info_overlay = Some("Checking stereochemistry with optional RDKit…".into());
+        self.info_overlay = Some(if apply_labels {
+            "Assigning CIP R/S labels with optional RDKit…".into()
+        } else {
+            "Checking stereochemistry with optional RDKit…".into()
+        });
+    }
+    fn apply_stereo_labels(&mut self, report: &str) {
+        let mut labels = BTreeMap::new();
+        for line in report.lines() {
+            let Some(rest) = line.strip_prefix("ATOM\t") else {
+                continue;
+            };
+            let mut fields = rest.split('\t');
+            let Ok(index) = fields.next().unwrap_or_default().parse::<usize>() else {
+                self.info_overlay =
+                    Some("RDKit returned an invalid atom index; no labels were applied.".into());
+                self.status = "Rejected invalid CIP-label output; structure unchanged".into();
+                return;
+            };
+            let label = fields.next().unwrap_or_default();
+            if index == 0
+                || index > self.mol.atoms.len()
+                || !matches!(label, "R" | "S")
+                || fields.next().is_some()
+                || labels.insert(index - 1, label).is_some()
+            {
+                self.info_overlay = Some(
+                    "RDKit returned invalid or duplicate CIP labels; no labels were applied."
+                        .into(),
+                );
+                self.status = "Rejected invalid CIP-label output; structure unchanged".into();
+                return;
+            }
+        }
+        let changes = self.mol.atoms.iter().enumerate().any(|(index, atom)| {
+            let current = atom
+                .stereo
+                .as_deref()
+                .filter(|value| matches!(*value, "R" | "S"));
+            current != labels.get(&index).copied()
+        });
+        if changes {
+            self.checkpoint();
+            for (index, atom) in self.mol.atoms.iter_mut().enumerate() {
+                if matches!(atom.stereo.as_deref(), Some("R" | "S")) {
+                    atom.stereo = None;
+                }
+                if let Some(label) = labels.get(&index) {
+                    atom.stereo = Some((*label).to_string());
+                }
+            }
+        }
+        let count = labels.len();
+        self.info_overlay = Some(format!(
+            "{}\n\nApplied {count} CIP label(s) from RDKit. Drawing wedge/hash marks define the stereochemistry; labels are undoable annotations.",
+            report.trim()
+        ));
+        self.info_scroll = 0;
+        self.status = format!("Applied {count} calculated CIP label(s)");
     }
     fn start_rdkit_chemical_report(&mut self, operation: &'static str) {
+        if self.refuse_overlapping_worker() {
+            return;
+        }
         if self.mol.atoms.is_empty() {
             self.info_overlay = Some("Draw a structure first".into());
             return;
@@ -2058,6 +3039,71 @@ impl Editor {
         self.calc_rx = Some((captured, rx));
         self.info_overlay = Some(format!("Running optional RDKit {operation} analysis…"));
         self.info_scroll = 0;
+    }
+    fn start_rdkit_partial_charges(&mut self) {
+        if self.refuse_overlapping_worker() {
+            return;
+        }
+        if self.mol.atoms.is_empty() {
+            self.info_overlay = Some("Draw a structure before calculating partial charges".into());
+            return;
+        }
+        if self.mol.atoms.len() > 999
+            || self.mol.bonds.len() > 999
+            || self.mol.atoms.iter().any(|atom| {
+                atom.alias.is_some()
+                    || atom.query.is_some()
+                    || atom.r_group.is_some()
+                    || !chemistry::valid_element(&atom.element)
+            })
+            || self.mol.bonds.iter().any(|bond| bond.query.is_some())
+        {
+            self.info_overlay = Some("The optional RDKit Gasteiger calculation accepts ordinary MOL V2000 atom/bond graphs only. Query atoms, aliases and R-groups are refused; the drawing was not changed.".into());
+            return;
+        }
+        let block = self.molfile();
+        let captured = self.mol.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(rdkit::partial_charge_report(&block));
+        });
+        self.calc_rx = Some((captured, rx));
+        self.info_overlay =
+            Some("Calculating Gasteiger-Marsili partial charges with optional RDKit…".into());
+        self.info_scroll = 0;
+        self.status = "Calculating modelled partial charges…".into();
+    }
+    fn start_pubchem_lookup(&mut self) {
+        if self.refuse_overlapping_worker() {
+            return;
+        }
+        if self.mol.atoms.is_empty() {
+            self.info_overlay =
+                Some("Draw or open a structure before looking it up in PubChem".into());
+            return;
+        }
+        let smiles = match smiles::export(&self.mol) {
+            Ok(smiles) => smiles,
+            Err(error) => {
+                self.info_overlay = Some(format!(
+                    "PubChem lookup cannot safely identify this drawing as a complete structure. No data was sent.\n\n{error}"
+                ));
+                return;
+            }
+        };
+        let captured = self.mol.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                pubchem::lookup(&smiles).map_err(|message| format!("PUBCHEM_LOOKUP\n{message}"));
+            let _ = tx.send(result);
+        });
+        self.calc_rx = Some((captured, rx));
+        self.info_overlay = Some(
+            "Sending the current structure to PubChem through the official NCBI PUG REST API. The drawing will not be changed.".into(),
+        );
+        self.info_scroll = 0;
+        self.status = "Fetching matching PubChem database records…".into();
     }
     fn apply_rdkit_molblock(&mut self, metadata: &str, block: &str) {
         let operation = metadata
@@ -2145,7 +3191,7 @@ impl Editor {
         self.undo.clear();
         self.redo.clear();
         self.clear_selection();
-        self.zoom = 1.;
+        self.zoom = self.preferred_zoom;
         self.pan = Vec2::ZERO;
         self.status = "New document tab".into();
     }
@@ -2180,7 +3226,7 @@ impl Editor {
         self.undo.clear();
         self.redo.clear();
         self.clear_selection();
-        self.zoom = 1.;
+        self.zoom = self.preferred_zoom;
         self.pan = Vec2::ZERO;
     }
     fn autosave(&mut self) {
@@ -2376,7 +3422,7 @@ impl Editor {
             .iter_mut()
             .find(|x| (x.a == a && x.b == b) || (x.a == b && x.b == a))
         {
-            x.order = order;
+            set_bond_order_value(x, order);
         } else {
             self.mol.bonds.push(Bond {
                 a,
@@ -2401,8 +3447,22 @@ impl Editor {
         }
     }
     fn set_bond_order(&mut self, index: usize, order: u8) {
+        let order = order.clamp(1, 4);
         if let Some(bond) = self.mol.bonds.get(index) {
-            if bond.order == order.clamp(1, 4) {
+            let has_order_query = bond.query.as_deref().is_some_and(|query| {
+                query.split(';').any(|term| {
+                    matches!(
+                        term,
+                        "any" | "single-or-double" | "single-or-aromatic" | "double-or-aromatic"
+                    )
+                })
+            });
+            let expected_style = if order == 4 {
+                BondStyle::Aromatic
+            } else {
+                BondStyle::Normal
+            };
+            if bond.order == order && bond.style == expected_style && !has_order_query {
                 return;
             }
         } else {
@@ -2410,6 +3470,53 @@ impl Editor {
         }
         self.checkpoint();
         set_bond_order_value(&mut self.mol.bonds[index], order);
+        self.refresh_aromatic_atoms();
+    }
+    fn set_bond_query(&mut self, index: usize, query: &str) {
+        let Some(bond) = self.mol.bonds.get(index) else {
+            return;
+        };
+        let mut terms: Vec<&str> = bond
+            .query
+            .as_deref()
+            .unwrap_or("")
+            .split(';')
+            .filter(|term| matches!(*term, "topology-ring" | "topology-chain"))
+            .collect();
+        terms.extend(query.split(';').filter(|term| !term.is_empty()));
+        terms.sort_unstable();
+        terms.dedup();
+        let combined = terms.join(";");
+        if bond.order == 1
+            && bond.style == BondStyle::Any
+            && bond.stereo.is_none()
+            && bond.query.as_deref() == Some(combined.as_str())
+        {
+            return;
+        }
+        self.checkpoint();
+        let bond = &mut self.mol.bonds[index];
+        bond.order = 1;
+        bond.style = BondStyle::Any;
+        bond.stereo = None;
+        bond.query = Some(combined);
+        self.refresh_aromatic_atoms();
+    }
+    fn set_bond_style(&mut self, index: usize, style: BondStyle) {
+        let Some(bond) = self.mol.bonds.get(index) else {
+            return;
+        };
+        let order = if style == BondStyle::Aromatic { 4 } else { 1 };
+        if bond.order == order && bond.style == style {
+            return;
+        }
+        self.checkpoint();
+        let bond = &mut self.mol.bonds[index];
+        set_bond_order_value(bond, order);
+        bond.style = style;
+        self.refresh_aromatic_atoms();
+    }
+    fn refresh_aromatic_atoms(&mut self) {
         let aromatic_bonds: BTreeSet<usize> = self
             .mol
             .bonds
@@ -2421,6 +3528,52 @@ impl Editor {
             atom.aromatic = aromatic_bonds.contains(&atom_index);
         }
     }
+    fn apply_bond_tool_to_hit_bond(&mut self, point: Vec2) -> bool {
+        // Atom hits keep the usual click-and-drag workflow for drawing from an
+        // atom. Clicking the middle of an existing bond edits that bond in one
+        // step, matching the common chemistry-editor interaction.
+        if self.hit_atom(point).is_some() {
+            return false;
+        }
+        let Some(index) = self.hit_bond(point) else {
+            return false;
+        };
+        match self.tool {
+            Tool::Bond(order) => self.set_bond_order(index, order),
+            Tool::StyledBond(BondStyle::Any) if self.bond_query.is_some() => {
+                let query = self.bond_query.clone().unwrap();
+                self.set_bond_query(index, &query);
+            }
+            Tool::StyledBond(style) => self.set_bond_style(index, style),
+            _ => return false,
+        }
+        self.selected = None;
+        self.selected_atoms.clear();
+        self.selected_bond = Some(index);
+        self.selected_bonds = vec![index];
+        self.selected_graphic = None;
+        self.selected_graphics.clear();
+        let label = match self.mol.bonds[index].style {
+            BondStyle::Aromatic => "aromatic",
+            BondStyle::Wedge => "wedge",
+            BondStyle::Hash => "hashed wedge",
+            BondStyle::Wavy => "wavy",
+            BondStyle::Coordinate => "coordinate",
+            BondStyle::Any => "any-order",
+            BondStyle::Normal => match self.mol.bonds[index].order {
+                1 => "single",
+                2 => "double",
+                3 => "triple",
+                _ => "bond",
+            },
+        };
+        self.status = if self.tool == Tool::Bond(2) {
+            localized(self.language, "Changed existing bond to a double bond").into()
+        } else {
+            format!("Changed existing bond to {label}")
+        };
+        true
+    }
     fn cycle_bond_style(&mut self, index: usize) {
         let Some(bond) = self.mol.bonds.get(index) else {
             return;
@@ -2430,6 +3583,11 @@ impl Editor {
         let bond = &mut self.mol.bonds[index];
         if bond.order == 4 {
             bond.order = 1;
+        }
+        if matches!(style, BondStyle::Wedge | BondStyle::Hash | BondStyle::Wavy) && bond.order != 1
+        {
+            bond.order = 1;
+            bond.stereo = None;
         }
         bond.style = style;
         let aromatic_bonds: BTreeSet<usize> = self
@@ -2475,6 +3633,39 @@ impl Editor {
         self.checkpoint();
         self.mol.bonds[index].query = query;
     }
+    fn clear_atom_query(&mut self, index: usize) {
+        if self
+            .mol
+            .atoms
+            .get(index)
+            .is_some_and(|atom| atom.query.is_some())
+        {
+            self.checkpoint();
+            self.mol.atoms[index].query = None;
+        }
+    }
+    fn cycle_atom_radical(&mut self, index: usize) {
+        if let Some(atom) = self.mol.atoms.get(index) {
+            let next = (atom.radical + 1) % 4;
+            if next != atom.radical {
+                self.checkpoint();
+                self.mol.atoms[index].radical = next;
+            }
+        }
+    }
+    fn cycle_implicit_h_override(&mut self, index: usize) {
+        if let Some(atom) = self.mol.atoms.get(index) {
+            let next = match atom.implicit_h_override {
+                None => Some(0),
+                Some(count @ 0..=4) => Some(count + 1),
+                Some(_) => None,
+            };
+            if atom.implicit_h_override != next {
+                self.checkpoint();
+                self.mol.atoms[index].implicit_h_override = next;
+            }
+        }
+    }
     fn cycle_double_bond_stereo(&mut self, index: usize) {
         let Some(bond) = self.mol.bonds.get(index) else {
             return;
@@ -2485,6 +3676,260 @@ impl Editor {
         self.checkpoint();
         let bond = &mut self.mol.bonds[index];
         bond.stereo = next_double_bond_stereo(bond.stereo.as_deref());
+    }
+    fn selected_fragment_for_template(&self) -> Result<Molecule, String> {
+        let mut selected = self.selected_atoms.iter().copied().collect::<BTreeSet<_>>();
+        if selected.is_empty() {
+            if let Some(index) = self.selected {
+                selected.insert(index);
+            }
+        }
+        selected.retain(|index| *index < self.mol.atoms.len());
+        if selected.is_empty() {
+            return Err("Select a connected atom fragment before saving a template".into());
+        }
+        let center = selected
+            .iter()
+            .map(|index| self.mol.atoms[*index].pos)
+            .sum::<Vec2>()
+            / selected.len() as f32;
+        let mut remap = vec![None; self.mol.atoms.len()];
+        let mut fragment = Molecule::default();
+        for source in &selected {
+            let mut atom = self.mol.atoms[*source].clone();
+            atom.pos -= center;
+            atom.atom_map = None;
+            atom.reaction_role = None;
+            atom.reaction_step = 1;
+            atom.coefficient = 1;
+            remap[*source] = Some(fragment.atoms.len());
+            fragment.atoms.push(atom);
+        }
+        for bond in &self.mol.bonds {
+            if let (Some(a), Some(b)) = (remap[bond.a], remap[bond.b]) {
+                let mut bond = bond.clone();
+                bond.a = a;
+                bond.b = b;
+                fragment.bonds.push(bond);
+            }
+        }
+        if molecule_components(&fragment).len() != 1 {
+            return Err("A saved template must be one connected fragment".into());
+        }
+        Ok(fragment)
+    }
+    fn save_selected_user_template(&mut self, name: &str) -> Result<(), String> {
+        let fragment = self.selected_fragment_for_template()?;
+        let template = save_user_template_to(&user_templates_path(), name, &fragment)?;
+        self.user_templates.push(template);
+        self.user_templates
+            .sort_by_key(|template| template.name.to_lowercase());
+        self.status = format!("Saved custom template: {}", name.trim());
+        Ok(())
+    }
+    fn delete_user_template(&mut self, index: usize) -> Result<(), String> {
+        let template = self
+            .user_templates
+            .get(index)
+            .ok_or("Select a custom template to delete")?;
+        fs::remove_file(&template.path).map_err(|error| error.to_string())?;
+        let name = template.name.clone();
+        self.user_templates.remove(index);
+        self.template_page = self
+            .template_page
+            .min(self.user_templates.len().saturating_sub(1) / 6);
+        self.status = format!("Deleted custom template: {name}");
+        Ok(())
+    }
+    fn rename_user_template(&mut self, index: usize, name: &str) -> Result<(), String> {
+        self.rename_user_template_in(index, name, &user_templates_path())
+    }
+    fn rename_user_template_in(
+        &mut self,
+        index: usize,
+        name: &str,
+        directory: &Path,
+    ) -> Result<(), String> {
+        let original = self
+            .user_templates
+            .get(index)
+            .cloned()
+            .ok_or("Select a custom template to rename")?;
+        if original.name == name.trim() {
+            return Ok(());
+        }
+        let renamed = save_user_template_to(directory, name, &original.mol)?;
+        if let Err(error) = fs::remove_file(&original.path) {
+            let cleanup = fs::remove_file(&renamed.path);
+            return Err(match cleanup {
+                Ok(()) => error.to_string(),
+                Err(cleanup_error) => format!(
+                    "Could not remove the old template ({error}); the new copy is at {} ({cleanup_error})",
+                    renamed.path.display()
+                ),
+            });
+        }
+        self.user_templates.remove(index);
+        self.user_templates.push(renamed);
+        self.user_templates
+            .sort_by_key(|template| template.name.to_lowercase());
+        self.status = format!("Renamed custom template to {}", name.trim());
+        Ok(())
+    }
+    fn insert_custom_template(&mut self, mut template: Molecule, center: Vec2) {
+        if template.atoms.is_empty() {
+            self.status = "The selected custom template is empty".into();
+            return;
+        }
+        self.checkpoint();
+        let origin = template
+            .atoms
+            .iter()
+            .fold(vec2(0., 0.), |sum, atom| sum + atom.pos)
+            / template.atoms.len() as f32;
+        let rotation = self.template_rotation;
+        for atom in &mut template.atoms {
+            atom.pos += center - origin;
+            atom.pos = rotate_template_point(atom.pos, center, rotation);
+            atom.atom_map = None;
+            atom.reaction_role = None;
+            atom.reaction_step = 1;
+            atom.coefficient = 1;
+        }
+        let offset = self.mol.atoms.len();
+        self.mol.atoms.extend(template.atoms);
+        self.mol
+            .bonds
+            .extend(template.bonds.into_iter().map(|mut bond| {
+                bond.a += offset;
+                bond.b += offset;
+                bond
+            }));
+        self.selected_atoms = (offset..self.mol.atoms.len()).collect();
+        self.selected = self.selected_atoms.first().copied();
+        self.template_rotation = 0;
+        self.status = if rotation == 0 {
+            format!("Placed custom template: {}", template.name)
+        } else {
+            format!(
+                "Placed custom template rotated {rotation}°: {}",
+                template.name
+            )
+        };
+    }
+    fn activate_builtin_template(&mut self, kind: &'static str) {
+        let mut scratch = Self::new();
+        scratch.insert_template(kind, vec2(0., 0.));
+        self.template_preview = Some(scratch.mol);
+        self.pending_custom_template = None;
+        self.template_attachment_target = None;
+        self.template_rotation = 0;
+        self.quick.pending.clear();
+        self.tool = Tool::Template(kind);
+        self.templates_open = false;
+        self.status = format!("Click canvas to place {kind}; press R to rotate");
+    }
+    fn activate_custom_template(&mut self, template: Molecule) {
+        let name = template.name.clone();
+        let mut preview = template.clone();
+        if !preview.atoms.is_empty() {
+            let origin = preview
+                .atoms
+                .iter()
+                .fold(vec2(0., 0.), |sum, atom| sum + atom.pos)
+                / preview.atoms.len() as f32;
+            for atom in &mut preview.atoms {
+                atom.pos -= origin;
+            }
+        }
+        self.template_preview = Some(preview);
+        self.pending_custom_template = Some(template);
+        self.template_attachment_target = None;
+        self.template_rotation = 0;
+        self.quick.pending.clear();
+        self.tool = Tool::Template("User");
+        self.templates_open = false;
+        self.status = format!("Click canvas to place {name}; press R to rotate");
+    }
+    fn template_anchor(&self) -> Option<(usize, Vec2)> {
+        let preview = self.template_preview.as_ref()?;
+        let (index, atom) =
+            preview.atoms.iter().enumerate().min_by(|(_, a), (_, b)| {
+                a.pos.length_squared().total_cmp(&b.pos.length_squared())
+            })?;
+        Some((index, atom.pos))
+    }
+    fn template_placement_center(&self, cursor: Vec2) -> Vec2 {
+        let Some(target) = self.template_attachment_target else {
+            return cursor;
+        };
+        let Some(target_atom) = self.mol.atoms.get(target) else {
+            return cursor;
+        };
+        let Some((_, anchor)) = self.template_anchor() else {
+            return cursor;
+        };
+        let direction = cursor - target_atom.pos;
+        let direction = if direction.length() < 1. {
+            vec2(1., 0.)
+        } else {
+            direction.normalize()
+        };
+        target_atom.pos + direction * BOND
+            - rotate_template_point(anchor, vec2(0., 0.), self.template_rotation)
+    }
+    fn connect_template_atom(&mut self, target: Option<usize>, inserted: usize, anchor: usize) {
+        let Some(target) = target.filter(|index| *index < inserted) else {
+            return;
+        };
+        let anchor = inserted + anchor;
+        if anchor >= self.mol.atoms.len() {
+            return;
+        }
+        self.mol.bonds.push(Bond {
+            a: target,
+            b: anchor,
+            order: 1,
+            style: BondStyle::Normal,
+            stereo: None,
+            query: None,
+        });
+        self.selected_atoms = vec![target, anchor];
+        self.selected = Some(anchor);
+        self.status = "Template attached to the selected atom with a single bond".into();
+    }
+    fn toggle_template_attachment(&mut self) {
+        if !matches!(self.tool, Tool::Template(_)) {
+            return;
+        }
+        if self.template_attachment_target.is_some() {
+            self.template_attachment_target = None;
+            self.status = "Template will be placed as a separate fragment".into();
+            return;
+        }
+        if self.selected_atoms.len() != 1 {
+            self.status = "Select exactly one atom, then press A to attach the template".into();
+            return;
+        }
+        let target = self.selected_atoms[0];
+        if target >= self.mol.atoms.len() {
+            self.status = "Selected attachment atom is no longer available".into();
+            return;
+        }
+        self.template_attachment_target = Some(target);
+        self.status =
+            "Template will attach to the selected atom; move pointer to set direction".into();
+    }
+    fn cancel_template_placement(&mut self) {
+        if matches!(self.tool, Tool::Template(_)) {
+            self.tool = Tool::Select;
+            self.template_preview = None;
+            self.pending_custom_template = None;
+            self.template_rotation = 0;
+            self.template_attachment_target = None;
+            self.quick.pending.clear();
+            self.status = "Template placement cancelled".into();
+        }
     }
     fn remove_atom(&mut self, i: usize) {
         self.mol.atoms.remove(i);
@@ -2499,16 +3944,168 @@ impl Editor {
         }
     }
     fn ring(&mut self, center: Vec2, n: usize) {
+        self.ring_with_snap(center, n, true);
+    }
+    fn ring_with_snap(&mut self, center: Vec2, n: usize, snap_to_existing: bool) {
         let radius = BOND / (2. * (std::f32::consts::PI / n as f32).sin());
         let mut ids = Vec::new();
         for k in 0..n {
             let t = -std::f32::consts::FRAC_PI_2 + 2. * std::f32::consts::PI * k as f32 / n as f32;
             let p = center + vec2(t.cos(), t.sin()) * radius;
-            let id = self.hit_atom(p).unwrap_or_else(|| self.add_atom(p, "C"));
+            let existing = snap_to_existing.then(|| self.hit_atom(p)).flatten();
+            let id = existing.unwrap_or_else(|| self.add_atom(p, "C"));
             ids.push(id);
         }
         for k in 0..n {
             self.add_bond(ids[k], ids[(k + 1) % n], 1);
+        }
+    }
+    fn fused_ring_template(
+        &mut self,
+        center: Vec2,
+        first_size: usize,
+        second_size: usize,
+        aromatic: bool,
+        heteroatom: Option<(&str, usize, u8)>,
+    ) {
+        let apothem = |size: usize| BOND / (2. * (std::f32::consts::PI / size as f32).tan());
+        let first_apothem = apothem(first_size);
+        let second_apothem = apothem(second_size);
+        let mut first = Vec::with_capacity(first_size);
+        for k in 0..first_size {
+            let angle = std::f32::consts::FRAC_PI_2 - std::f32::consts::PI / first_size as f32
+                + 2. * std::f32::consts::PI * k as f32 / first_size as f32;
+            let pos = center + vec2(angle.cos() * BOND, angle.sin() * BOND - first_apothem);
+            first.push(self.add_atom(pos, "C"));
+        }
+        let mut second = Vec::with_capacity(second_size);
+        for k in 0..second_size {
+            if k == 0 {
+                second.push(first[1]);
+                continue;
+            }
+            if k == 1 {
+                second.push(first[0]);
+                continue;
+            }
+            let angle = 3. * std::f32::consts::FRAC_PI_2
+                - std::f32::consts::PI / second_size as f32
+                + 2. * std::f32::consts::PI * k as f32 / second_size as f32;
+            let pos = center + vec2(angle.cos() * BOND, angle.sin() * BOND + second_apothem);
+            let element = heteroatom
+                .filter(|(_, ring_position, _)| *ring_position == k)
+                .map_or("C", |(element, _, _)| element);
+            let id = self.add_atom(pos, element);
+            if let Some((_, ring_position, hydrogen)) = heteroatom {
+                if ring_position == k {
+                    self.mol.atoms[id].explicit_h = hydrogen;
+                }
+            }
+            second.push(id);
+        }
+        for ring in [&first[..], &second[..]] {
+            for k in 0..ring.len() {
+                let a = ring[k];
+                let b = ring[(k + 1) % ring.len()];
+                if self
+                    .mol
+                    .bonds
+                    .iter()
+                    .any(|bond| (bond.a == a && bond.b == b) || (bond.a == b && bond.b == a))
+                {
+                    continue;
+                }
+                self.add_bond(a, b, if aromatic { 4 } else { 1 });
+                if aromatic {
+                    if let Some(bond) = self.mol.bonds.last_mut() {
+                        bond.style = BondStyle::Aromatic;
+                    }
+                }
+            }
+        }
+        if aromatic {
+            for atom in first.iter().chain(second.iter()) {
+                self.mol.atoms[*atom].aromatic = true;
+            }
+        }
+    }
+    fn norbornane_template(&mut self, center: Vec2) {
+        let points = [
+            center + vec2(-BOND, 0.),
+            center + vec2(BOND, 0.),
+            center + vec2(-BOND * 0.5, -BOND * 0.8660254),
+            center + vec2(BOND * 0.5, -BOND * 0.8660254),
+            center + vec2(-BOND * 0.5, BOND * 0.8660254),
+            center + vec2(BOND * 0.5, BOND * 0.8660254),
+            center,
+        ];
+        let ids: Vec<usize> = points.iter().map(|pos| self.add_atom(*pos, "C")).collect();
+        for (a, b) in [
+            (0, 2),
+            (2, 3),
+            (3, 1),
+            (0, 4),
+            (4, 5),
+            (5, 1),
+            (0, 6),
+            (6, 1),
+        ] {
+            self.add_bond(ids[a], ids[b], 1);
+        }
+    }
+    fn aromatic_tricyclic_template(&mut self, center: Vec2, angular: bool) {
+        let root_three = 1.7320508 * BOND;
+        let translation = if angular {
+            vec2(-0.75 * BOND, 0.4330127 * BOND)
+        } else {
+            vec2(0., 0.)
+        };
+        let ring_centers = if angular {
+            [
+                center + translation + vec2(0., -root_three),
+                center + translation,
+                center + translation + vec2(1.5 * BOND, 0.5 * root_three),
+            ]
+        } else {
+            [
+                center + vec2(0., -root_three),
+                center,
+                center + vec2(0., root_three),
+            ]
+        };
+        let mut coordinate_atoms = BTreeMap::<(i32, i32), usize>::new();
+        let mut rings = Vec::with_capacity(3);
+        for ring_center in ring_centers {
+            let mut ring = Vec::with_capacity(6);
+            for k in 0..6 {
+                let angle = k as f32 * std::f32::consts::PI / 3.;
+                let pos = ring_center + vec2(angle.cos(), angle.sin()) * BOND;
+                let key = (
+                    (pos.x * 1000.).round() as i32,
+                    (pos.y * 1000.).round() as i32,
+                );
+                let atom = *coordinate_atoms
+                    .entry(key)
+                    .or_insert_with(|| self.add_atom(pos, "C"));
+                ring.push(atom);
+            }
+            rings.push(ring);
+        }
+        let mut added = BTreeSet::new();
+        for ring in rings {
+            for k in 0..6 {
+                let (a, b) = (ring[k], ring[(k + 1) % 6]);
+                let edge = (a.min(b), a.max(b));
+                if added.insert(edge) {
+                    self.add_bond(a, b, 4);
+                    if let Some(bond) = self.mol.bonds.last_mut() {
+                        bond.style = BondStyle::Aromatic;
+                    }
+                }
+            }
+        }
+        for atom in coordinate_atoms.values() {
+            self.mol.atoms[*atom].aromatic = true;
         }
     }
     fn add_explicit_hydrogens(&mut self) {
@@ -2755,6 +4352,232 @@ impl Editor {
         }
         self.status = "Cleaned 2D coordinates using a spring layout".into();
     }
+    fn add_aromatic_template_ring(
+        &mut self,
+        center: Vec2,
+        size: usize,
+        heteroatoms: &[(usize, &str, bool)],
+    ) -> Vec<usize> {
+        let radius = BOND / (2.0 * (std::f32::consts::PI / size as f32).sin());
+        let mut atoms = Vec::with_capacity(size);
+        for index in 0..size {
+            let angle =
+                -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * index as f32 / size as f32;
+            let element = heteroatoms
+                .iter()
+                .find(|(position, _, _)| *position == index)
+                .map(|(_, element, _)| *element)
+                .unwrap_or("C");
+            let atom = self.add_atom(center + vec2(angle.cos(), angle.sin()) * radius, element);
+            self.mol.atoms[atom].aromatic = true;
+            if heteroatoms
+                .iter()
+                .any(|(position, _, explicit_h)| *position == index && *explicit_h)
+            {
+                self.mol.atoms[atom].explicit_h = 1;
+            }
+            atoms.push(atom);
+        }
+        for index in 0..size {
+            self.add_bond(atoms[index], atoms[(index + 1) % size], 4);
+            if let Some(bond) = self.mol.bonds.iter_mut().find(|bond| {
+                (bond.a == atoms[index] && bond.b == atoms[(index + 1) % size])
+                    || (bond.b == atoms[index] && bond.a == atoms[(index + 1) % size])
+            }) {
+                bond.style = BondStyle::Aromatic;
+            }
+        }
+        atoms
+    }
+    fn insert_amino_acid(&mut self, kind: &str, center: Vec2) {
+        let at = |x: f32, y: f32| center + vec2(BOND * x, BOND * y);
+        let n = self.add_atom(at(-1.0, 0.0), "N");
+        let ca = self.add_atom(center, "C");
+        let carbonyl = self.add_atom(at(1.0, 0.0), "C");
+        let carbonyl_o = self.add_atom(at(1.5, -0.866), "O");
+        let hydroxyl_o = self.add_atom(at(1.5, 0.866), "O");
+        self.add_bond(n, ca, 1);
+        self.add_bond(ca, carbonyl, 1);
+        self.add_bond(carbonyl, carbonyl_o, 2);
+        self.add_bond(carbonyl, hydroxyl_o, 1);
+
+        let add = |editor: &mut Self, pos: Vec2, element: &str| editor.add_atom(pos, element);
+        let attach = |editor: &mut Self, a: usize, b: usize, order| editor.add_bond(a, b, order);
+        match kind {
+            "Glycine" => {}
+            "Alanine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                attach(self, ca, beta, 1);
+            }
+            "Valine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                let methyl_a = add(self, at(-0.866, 1.5), "C");
+                let methyl_b = add(self, at(0.866, 1.5), "C");
+                attach(self, ca, beta, 1);
+                attach(self, beta, methyl_a, 1);
+                attach(self, beta, methyl_b, 1);
+            }
+            "Leucine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                let gamma = add(self, at(0.866, 1.5), "C");
+                let delta_a = add(self, at(1.732, 1.0), "C");
+                let delta_b = add(self, at(0.866, 2.5), "C");
+                attach(self, ca, beta, 1);
+                attach(self, beta, gamma, 1);
+                attach(self, gamma, delta_a, 1);
+                attach(self, gamma, delta_b, 1);
+            }
+            "Isoleucine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                let gamma = add(self, at(0.866, 1.5), "C");
+                let methyl_a = add(self, at(-0.866, 1.5), "C");
+                let methyl_b = add(self, at(1.732, 1.0), "C");
+                attach(self, ca, beta, 1);
+                attach(self, beta, gamma, 1);
+                attach(self, beta, methyl_a, 1);
+                attach(self, gamma, methyl_b, 1);
+            }
+            "Serine" | "Cysteine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                let end = add(
+                    self,
+                    at(0.866, 1.5),
+                    if kind == "Serine" { "O" } else { "S" },
+                );
+                attach(self, ca, beta, 1);
+                attach(self, beta, end, 1);
+            }
+            "Threonine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                let hydroxyl = add(self, at(-0.866, 1.5), "O");
+                let methyl = add(self, at(0.866, 1.5), "C");
+                attach(self, ca, beta, 1);
+                attach(self, beta, hydroxyl, 1);
+                attach(self, beta, methyl, 1);
+            }
+            "Methionine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                let gamma = add(self, at(0.866, 1.5), "C");
+                let sulfur = add(self, at(1.732, 1.0), "S");
+                let methyl = add(self, at(2.598, 1.5), "C");
+                attach(self, ca, beta, 1);
+                attach(self, beta, gamma, 1);
+                attach(self, gamma, sulfur, 1);
+                attach(self, sulfur, methyl, 1);
+            }
+            "Aspartic acid" | "Asparagine" | "Glutamic acid" | "Glutamine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                attach(self, ca, beta, 1);
+                let mut previous = beta;
+                if matches!(kind, "Glutamic acid" | "Glutamine") {
+                    let gamma = add(self, at(0.866, 1.5), "C");
+                    attach(self, beta, gamma, 1);
+                    previous = gamma;
+                }
+                let side_carbonyl = add(self, at(1.732, 1.0), "C");
+                let side_oxo = add(self, at(2.232, 0.134), "O");
+                let side_hetero = add(
+                    self,
+                    at(2.232, 1.866),
+                    if matches!(kind, "Asparagine" | "Glutamine") {
+                        "N"
+                    } else {
+                        "O"
+                    },
+                );
+                attach(self, previous, side_carbonyl, 1);
+                attach(self, side_carbonyl, side_oxo, 2);
+                attach(self, side_carbonyl, side_hetero, 1);
+            }
+            "Lysine" => {
+                let b = add(self, at(0.0, 1.0), "C");
+                let g = add(self, at(0.866, 1.5), "C");
+                let d = add(self, at(1.732, 1.0), "C");
+                let e = add(self, at(2.598, 1.5), "C");
+                let z = add(self, at(3.464, 1.0), "N");
+                attach(self, ca, b, 1);
+                attach(self, b, g, 1);
+                attach(self, g, d, 1);
+                attach(self, d, e, 1);
+                attach(self, e, z, 1);
+            }
+            "Arginine" => {
+                let b = add(self, at(0.0, 1.0), "C");
+                let g = add(self, at(0.866, 1.5), "C");
+                let d = add(self, at(1.732, 1.0), "C");
+                let e = add(self, at(2.598, 1.5), "N");
+                let z = add(self, at(3.464, 1.0), "C");
+                let n_double = add(self, at(4.33, 0.5), "N");
+                let n_single_a = add(self, at(4.33, 1.5), "N");
+                attach(self, ca, b, 1);
+                attach(self, b, g, 1);
+                attach(self, g, d, 1);
+                attach(self, d, e, 1);
+                attach(self, e, z, 1);
+                attach(self, z, n_double, 2);
+                attach(self, z, n_single_a, 1);
+            }
+            "Phenylalanine" | "Tyrosine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                attach(self, ca, beta, 1);
+                let ring = self.add_aromatic_template_ring(at(0.0, 3.0), 6, &[]);
+                attach(self, beta, ring[0], 1);
+                if kind == "Tyrosine" {
+                    let oxygen = add(self, at(1.0, 4.0), "O");
+                    attach(self, ring[3], oxygen, 1);
+                }
+            }
+            "Histidine" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                attach(self, ca, beta, 1);
+                let ring = self.add_aromatic_template_ring(
+                    at(0.0, 3.0),
+                    5,
+                    &[(1, "N", false), (3, "N", true)],
+                );
+                attach(self, beta, ring[0], 1);
+            }
+            "Tryptophan" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                attach(self, ca, beta, 1);
+                let benzene = self.add_aromatic_template_ring(at(0.0, 3.0), 6, &[]);
+                attach(self, beta, benzene[0], 1);
+                let b = self.mol.atoms[benzene[3]].pos;
+                let positions = [
+                    b + vec2(-0.743, -0.669) * BOND,
+                    b + vec2(-0.336, -1.583) * BOND,
+                    b + vec2(0.659, -1.478) * BOND,
+                ];
+                let c = add(self, positions[0], "C");
+                self.mol.atoms[c].aromatic = true;
+                let nh = add(self, positions[1], "N");
+                self.mol.atoms[nh].aromatic = true;
+                self.mol.atoms[nh].explicit_h = 1;
+                let d = add(self, positions[2], "C");
+                self.mol.atoms[d].aromatic = true;
+                for (u, v) in [(benzene[2], c), (c, nh), (nh, d), (d, benzene[3])] {
+                    attach(self, u, v, 4);
+                    if let Some(bond) =
+                        self.mol.bonds.iter_mut().find(|bond| {
+                            (bond.a == u && bond.b == v) || (bond.a == v && bond.b == u)
+                        })
+                    {
+                        bond.style = BondStyle::Aromatic;
+                    }
+                }
+            }
+            "Proline" => {
+                let beta = add(self, at(0.0, 1.0), "C");
+                let gamma = add(self, at(-0.866, 1.5), "C");
+                let delta = add(self, at(-1.589, 0.809), "C");
+                attach(self, ca, beta, 1);
+                attach(self, beta, gamma, 1);
+                attach(self, gamma, delta, 1);
+                attach(self, delta, n, 1);
+            }
+            _ => {}
+        }
+    }
     fn suggest_endpoint(&self, i: usize) -> Vec2 {
         let origin = self.mol.atoms[i].pos;
         let neighbors: Vec<Vec2> = self
@@ -2792,7 +4615,28 @@ impl Editor {
         origin + out * BOND
     }
     fn insert_template(&mut self, kind: &str, center: Vec2) {
+        if kind == "User" {
+            if let Some(template) = self.pending_custom_template.clone() {
+                let inserted = self.mol.atoms.len();
+                let attachment_target = self.template_attachment_target;
+                let anchor = self.template_anchor().map(|(index, _)| index).unwrap_or(0);
+                let center = self.template_placement_center(center);
+                self.insert_custom_template(template, center);
+                if attachment_target.is_some() {
+                    self.connect_template_atom(attachment_target, inserted, anchor);
+                    self.template_attachment_target = None;
+                }
+            } else {
+                self.status = "Choose a custom template in the template library first".into();
+            }
+            return;
+        }
+        let center = self.template_placement_center(center);
         self.checkpoint();
+        let first_atom = self.mol.atoms.len();
+        let rotation = self.template_rotation;
+        let attachment_target = self.template_attachment_target;
+        let anchor = self.template_anchor().map(|(index, _)| index).unwrap_or(0);
         match kind {
             "Benzene" | "Cyclohexane" | "Pyridine" | "Pyrimidine" | "Imidazole" | "Pyrrole"
             | "Furan" | "Thiophene" => {
@@ -2803,7 +4647,7 @@ impl Editor {
                 } else {
                     6
                 };
-                self.ring(center, size);
+                self.ring_with_snap(center, size, rotation == 0 && attachment_target.is_none());
                 if kind != "Cyclohexane" {
                     for b in self.mol.bonds.iter_mut().skip(first_b) {
                         b.style = BondStyle::Aromatic;
@@ -2846,8 +4690,16 @@ impl Editor {
                     "Cycloheptane" => 7,
                     _ => 8,
                 };
-                self.ring(center, n);
+                self.ring_with_snap(center, n, rotation == 0 && attachment_target.is_none());
             }
+            "Naphthalene" | "Decalin" => {
+                self.fused_ring_template(center, 6, 6, kind == "Naphthalene", None)
+            }
+            "Indole" => self.fused_ring_template(center, 6, 5, true, Some(("N", 2, 1))),
+            "Quinoline" => self.fused_ring_template(center, 6, 6, true, Some(("N", 2, 0))),
+            "Anthracene" => self.aromatic_tricyclic_template(center, false),
+            "Phenanthrene" => self.aromatic_tricyclic_template(center, true),
+            "Norbornane" => self.norbornane_template(center),
             "Ethanol" => {
                 let a = self.add_atom(center - vec2(BOND, 0.), "C");
                 let b = self.add_atom(center, "C");
@@ -2890,25 +4742,33 @@ impl Editor {
                 self.add_bond(carbon, hetero, 1);
                 self.add_bond(carbon, methyl, 1);
             }
-            "Glycine" | "Alanine" => {
-                let n = self.add_atom(center - vec2(BOND * 1.5, 0.), "N");
-                let ca = self.add_atom(center - vec2(BOND * 0.5, 0.), "C");
-                let c = self.add_atom(center + vec2(BOND * 0.5, 0.), "C");
-                let o = self.add_atom(center + vec2(BOND * 1.2, -BOND * 0.55), "O");
-                let oh = self.add_atom(center + vec2(BOND * 1.2, BOND * 0.55), "O");
-                self.add_bond(n, ca, 1);
-                self.add_bond(ca, c, 1);
-                self.add_bond(c, o, 2);
-                self.add_bond(c, oh, 1);
-                if kind == "Alanine" {
-                    let methyl = self.add_atom(center - vec2(BOND * 0.5, BOND), "C");
-                    self.add_bond(ca, methyl, 1);
-                }
+            "Glycine" | "Alanine" | "Valine" | "Leucine" | "Isoleucine" | "Serine"
+            | "Threonine" | "Cysteine" | "Methionine" | "Aspartic acid" | "Asparagine"
+            | "Glutamic acid" | "Glutamine" | "Lysine" | "Arginine" | "Histidine"
+            | "Phenylalanine" | "Tyrosine" | "Tryptophan" | "Proline" => {
+                self.insert_amino_acid(kind, center);
             }
             _ => {}
         }
+        for atom in self.mol.atoms.iter_mut().skip(first_atom) {
+            atom.pos = rotate_template_point(atom.pos, center, rotation);
+        }
+        if attachment_target.is_some() {
+            self.connect_template_atom(attachment_target, first_atom, anchor);
+            self.template_attachment_target = None;
+        }
+        self.template_rotation = 0;
     }
     fn save(&mut self, path: &str) {
+        let losses = self.export_losses(path);
+        if !losses.is_empty() {
+            self.pending_export = Some(path.to_string());
+            self.status = format!("Export will lose: {}", losses.join(", "));
+            return;
+        }
+        self.save_confirmed(path);
+    }
+    fn save_confirmed(&mut self, path: &str) {
         let lower = path.to_lowercase();
         let export_only = [
             ".svg",
@@ -2916,6 +4776,7 @@ impl Editor {
             ".pdf",
             ".smi",
             ".smiles",
+            ".smarts",
             ".cml",
             ".pdb",
             ".inchi",
@@ -2957,20 +4818,33 @@ impl Editor {
                 }
             }
         } else if lower.ends_with(".smi") || lower.ends_with(".smiles") {
-            match rdkit::to_smiles(&self.molfile()) {
+            let block = self.molfile();
+            match smiles::export(&self.mol).or_else(|local_error| {
+                rdkit::to_smiles_with_stereo(&block, &self.mol).map_err(|rdkit_error| {
+                    format!("Local SMILES exporter: {local_error}; optional RDKit fallback: {rdkit_error}")
+                })
+            }) {
                 Ok(smiles) => fs::write(path, format!("{}\n", smiles.trim())),
                 Err(error) => {
-                    self.status = format!("SMILES export requires optional RDKit: {error}");
+                    self.status = format!("SMILES export unavailable: {error}");
                     return;
                 }
             }
-        } else if [".cml", ".pdb", ".inchi", ".inchikey"]
+        } else if lower.ends_with(".smarts") {
+            match smarts::export(&self.mol) {
+                Ok(pattern) => fs::write(path, format!("{pattern}\n")),
+                Err(error) => {
+                    self.status = format!("SMARTS export unavailable: {error}");
+                    return;
+                }
+            }
+        } else if lower.ends_with(".cml") {
+            fs::write(path, cml::write(&self.mol))
+        } else if [".pdb", ".inchi", ".inchikey"]
             .iter()
             .any(|ext| lower.ends_with(ext))
         {
-            let operation = if lower.ends_with(".cml") {
-                "to-cml"
-            } else if lower.ends_with(".pdb") {
+            let operation = if lower.ends_with(".pdb") {
                 "to-pdb"
             } else if lower.ends_with(".inchikey") {
                 "to-inchikey"
@@ -2989,7 +4863,7 @@ impl Editor {
             }
         } else {
             self.status =
-                "Unsupported extension. Use .mols, .mol, .sdf, .rxn, .smi, .cml, .pdb, .inchi, .inchikey, .svg, .png or .pdf"
+                "Unsupported extension. Use .mols, .mol, .sdf, .rxn, .smi, .smarts, .cml, .pdb, .inchi, .inchikey, .svg, .png or .pdf"
                     .into();
             return;
         };
@@ -3024,6 +4898,24 @@ impl Editor {
     }
     fn save_all(&mut self) {
         self.sync_active_document();
+        for doc in &self.documents {
+            let Some(path) = doc.path.as_deref() else {
+                continue;
+            };
+            if !path.to_lowercase().ends_with(".mol") {
+                continue;
+            }
+            let losses = Self::export_losses_for(&doc.snapshot.mol, &doc.snapshot.graphics, path);
+            if !losses.is_empty() {
+                self.pending_export = Some(path.to_string());
+                self.status = format!(
+                    "Save all needs export confirmation for {}: {}",
+                    path,
+                    losses.join(", ")
+                );
+                return;
+            }
+        }
         let mut saved = 0usize;
         for (i, doc) in self.documents.iter_mut().enumerate() {
             let Some(path) = doc.path.clone() else {
@@ -3065,32 +4957,63 @@ impl Editor {
         match fs::read_to_string(path) {
             Ok(s) => {
                 let lower = path.to_lowercase();
+                if lower.ends_with(".smarts") {
+                    match smarts::parse(&s) {
+                        Ok(mol) => {
+                            self.open_snapshot_tab(
+                                Snapshot {
+                                    mol,
+                                    graphics: vec![],
+                                },
+                                Some(path.into()),
+                            );
+                            self.record_recent(path);
+                            self.status = format!("Opened SMARTS pattern {path}");
+                        }
+                        Err(error) => self.status = format!("SMARTS import failed: {error}"),
+                    }
+                    return;
+                }
                 if lower.ends_with(".smi") || lower.ends_with(".smiles") {
                     let smiles = s
                         .lines()
-                        .next()
+                        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
                         .unwrap_or("")
                         .split_whitespace()
                         .next()
                         .unwrap_or("");
-                    match rdkit::from_smiles(smiles) {
-                        Ok(molblock) => match parse_mol(&molblock) {
-                            Ok(mol) => {
-                                self.open_snapshot_tab(
-                                    Snapshot {
-                                        mol,
-                                        graphics: vec![],
-                                    },
-                                    Some(path.into()),
-                                );
-                                self.record_recent(path);
-                                self.status = format!("Opened SMILES {path}");
-                            }
-                            Err(e) => self.status = format!("RDKit returned invalid MOL: {e}"),
-                        },
-                        Err(e) => {
-                            self.status = format!("SMILES import requires optional RDKit: {e}")
+                    let imported = smiles::parse(smiles).or_else(|local_error| {
+                        rdkit::from_smiles_with_stereo(smiles)
+                            .and_then(|(molblock, stereo)| {
+                                let mut mol = parse_mol(&molblock)?;
+                                for (index, value) in stereo {
+                                    let bond = mol.bonds.get_mut(index).ok_or(
+                                        "RDKit stereo annotation references a missing bond",
+                                    )?;
+                                    if bond.order != 2 {
+                                        return Err("RDKit assigned alkene stereo to a non-double bond".into());
+                                    }
+                                    bond.stereo = Some(value);
+                                }
+                                Ok(mol)
+                            })
+                            .map_err(|rdkit_error| {
+                                format!("Local SMILES parser: {local_error}; optional RDKit fallback: {rdkit_error}")
+                            })
+                    });
+                    match imported {
+                        Ok(mol) => {
+                            self.open_snapshot_tab(
+                                Snapshot {
+                                    mol,
+                                    graphics: vec![],
+                                },
+                                Some(path.into()),
+                            );
+                            self.record_recent(path);
+                            self.status = format!("Opened SMILES {path}");
                         }
+                        Err(error) => self.status = format!("SMILES import unavailable: {error}"),
                     }
                     return;
                 }
@@ -3104,6 +5027,9 @@ impl Editor {
                     None
                 };
                 if let Some(operation) = import_op {
+                    if self.refuse_overlapping_worker() {
+                        return;
+                    }
                     let captured = self.mol.clone();
                     let filename = path.to_string();
                     let (tx, rx) = mpsc::channel();
@@ -3162,6 +5088,26 @@ impl Editor {
                     }
                     return;
                 }
+                if lower.ends_with(".cml") {
+                    match cml::parse(
+                        &s,
+                        vec2(screen_width() / 2., (TOP + screen_height() - BOTTOM) / 2.),
+                    ) {
+                        Ok(mol) => {
+                            self.open_snapshot_tab(
+                                Snapshot {
+                                    mol,
+                                    graphics: vec![],
+                                },
+                                Some(path.into()),
+                            );
+                            self.record_recent(path);
+                            self.status = format!("Opened CML molecule {path}");
+                        }
+                        Err(error) => self.status = format!("CML import failed: {error}"),
+                    }
+                    return;
+                }
                 let parsed = if lower.ends_with(".mols") {
                     native::read(&s)
                 } else {
@@ -3183,6 +5129,9 @@ impl Editor {
         }
     }
     fn export_losses(&self, path: &str) -> Vec<&'static str> {
+        Self::export_losses_for(&self.mol, &self.graphics, path)
+    }
+    fn export_losses_for(mol: &Molecule, graphics: &[Graphic], path: &str) -> Vec<&'static str> {
         if path.to_lowercase().ends_with(".mols") {
             return vec![];
         }
@@ -3195,23 +5144,68 @@ impl Editor {
         if path.to_lowercase().ends_with(".rxn") {
             return vec!["reaction arrows, conditions, atom maps, coefficients, multi-step data and graphical annotations"];
         }
+        if path.to_lowercase().ends_with(".smarts") {
+            return vec!["document metadata, reaction annotation and drawing objects"];
+        }
+        if path.to_lowercase().ends_with(".cml") {
+            return cml::export_losses(mol, !graphics.is_empty());
+        }
+        if [".smi", ".smiles"]
+            .iter()
+            .any(|extension| path.to_lowercase().ends_with(extension))
+        {
+            let mut losses = Vec::new();
+            if !graphics.is_empty() {
+                losses.push("graphics, reaction arrows, conditions and text");
+            }
+            if !mol.name.is_empty() || !mol.properties.is_empty() {
+                losses.push("molecule name and data fields");
+            }
+            if mol.atoms.iter().any(|atom| {
+                atom.pos.length_squared() > 0.01 || atom.z.is_some() || atom.coord3d.is_some()
+            }) {
+                losses.push("2D/3D coordinates and drawing layout");
+            }
+            if mol.atoms.iter().any(|atom| {
+                atom.alias.is_some()
+                    || atom.r_group.is_some()
+                    || atom.query.is_some()
+                    || atom.radical != 0
+                    || atom.valence_override.is_some()
+                    || atom.stereo.is_some()
+            }) {
+                losses.push("query, alias, R-group, radical, valence or stereo annotations");
+            }
+            if mol.bonds.iter().any(|bond| {
+                bond.query.is_some()
+                    || bond.stereo.is_some()
+                    || !matches!(bond.style, BondStyle::Normal | BondStyle::Aromatic)
+            }) {
+                losses.push("bond query, stereo or display annotations");
+            }
+            if mol.atoms.iter().any(|atom| {
+                atom.reaction_role.is_some() || atom.reaction_step != 1 || atom.coefficient != 1
+            }) {
+                losses.push("reaction roles, steps and stoichiometric coefficients");
+            }
+            return losses;
+        }
         let is_mol_exchange = [".mol", ".sdf"]
             .iter()
             .any(|extension| path.to_lowercase().ends_with(extension));
-        let mol_v3000 = is_mol_exchange && mol_uses_v3000(&self.mol);
+        let mol_v3000 = is_mol_exchange && mol_uses_v3000(mol);
         let mol_v2000 = is_mol_exchange && !mol_v3000;
-        let aromatic_atoms: BTreeSet<usize> = self
-            .mol
+        let aromatic_atoms: BTreeSet<usize> = mol
             .bonds
             .iter()
             .filter(|bond| bond.order == 4)
             .flat_map(|bond| [bond.a, bond.b])
             .collect();
         let mut v = Vec::new();
-        if !self.graphics.is_empty() {
+        if !graphics.is_empty() {
             v.push("graphics, reaction arrows and text");
         }
-        if self.mol.atoms.iter().enumerate().any(|(index, atom)| {
+        if mol.atoms.iter().enumerate().any(|(index, atom)| {
             atom.alias.is_some()
                 || atom.query.as_deref().is_some_and(|query| {
                     !mol_v3000 || v3000_query_attributes(Some(query)).1 || v3000_atom_type(atom).1
@@ -3232,7 +5226,7 @@ impl Editor {
         }) {
             v.push("advanced atom properties");
         }
-        if self.mol.bonds.iter().any(|bond| {
+        if mol.bonds.iter().any(|bond| {
             bond.stereo.is_some()
                 || (bond.query.is_some() && (!mol_v3000 || v3000_bond_attributes(bond).2))
                 || (is_mol_exchange && bond.style == BondStyle::Coordinate)
@@ -3241,11 +5235,10 @@ impl Editor {
         }) {
             v.push("bond styles or query data");
         }
-        if self.mol.atoms.iter().any(|a| a.atom_map.is_some()) {
+        if mol.atoms.iter().any(|a| a.atom_map.is_some()) {
             v.push("atom maps");
         }
-        if self
-            .mol
+        if mol
             .atoms
             .iter()
             .any(|a| a.reaction_role.is_some() || a.reaction_step != 1 || a.coefficient != 1)
@@ -3255,16 +5248,61 @@ impl Editor {
         v
     }
     fn request_save(&mut self, path: String) {
-        let loss = self.export_losses(&path);
-        if loss.is_empty() {
-            self.save(&path)
-        } else {
-            self.pending_export = Some(path);
-            self.status = format!("Export will lose: {}", loss.join(", "));
-        }
+        self.save(&path);
     }
     fn commit_text(&mut self) {
         if let Some(target) = self.text_target.take() {
+            match target {
+                TextTarget::TemplateName => {
+                    match self.save_selected_user_template(&self.text_buffer.clone()) {
+                        Ok(()) => self.template_tab_custom = true,
+                        Err(error) => self.status = error,
+                    }
+                    self.text_buffer.clear();
+                    return;
+                }
+                TextTarget::RenameUserTemplate(index) => {
+                    if let Err(error) = self.rename_user_template(index, &self.text_buffer.clone())
+                    {
+                        self.status = error;
+                    }
+                    self.text_buffer.clear();
+                    return;
+                }
+                TextTarget::MoleculeProperty => {
+                    self.apply_molecule_property_edit(&self.text_buffer.clone());
+                    self.text_buffer.clear();
+                    return;
+                }
+                TextTarget::ReactionCoefficient => {
+                    let value = self.text_buffer.trim().parse::<u8>();
+                    match value {
+                        Ok(value) if (1..=99).contains(&value) => {
+                            self.set_reaction_component(None, None, Some(value));
+                        }
+                        _ => {
+                            self.status =
+                                "Enter a whole-number reaction coefficient from 1 to 99".into();
+                        }
+                    }
+                    self.text_buffer.clear();
+                    return;
+                }
+                TextTarget::BufferPh
+                | TextTarget::PkaFromBuffer
+                | TextTarget::WeakAcidPh
+                | TextTarget::WeakBasePh
+                | TextTarget::StrongMixturePh
+                | TextTarget::PolyproticSpeciation
+                | TextTarget::BjerrumDiagram
+                | TextTarget::PolyproticTitrationPh
+                | TextTarget::PolyproticTitrationCurve => {
+                    self.calculate_acid_base(target, &self.text_buffer.clone());
+                    self.text_buffer.clear();
+                    return;
+                }
+                _ => {}
+            }
             self.checkpoint();
             match target {
                 TextTarget::New(pos) => self.graphics.push(Graphic::Text {
@@ -3284,23 +5322,610 @@ impl Editor {
                         *below = self.text_buffer.clone();
                     }
                 }
+                TextTarget::TemplateName => unreachable!(),
+                TextTarget::RenameUserTemplate(_) => unreachable!(),
+                TextTarget::MoleculeProperty => unreachable!(),
+                TextTarget::ReactionCoefficient => unreachable!(),
+                TextTarget::BufferPh
+                | TextTarget::PkaFromBuffer
+                | TextTarget::WeakAcidPh
+                | TextTarget::WeakBasePh
+                | TextTarget::StrongMixturePh
+                | TextTarget::PolyproticSpeciation
+                | TextTarget::BjerrumDiagram
+                | TextTarget::PolyproticTitrationPh
+                | TextTarget::PolyproticTitrationCurve => unreachable!(),
             }
             self.text_buffer.clear();
         }
     }
+    fn start_acid_base_input(&mut self, target: TextTarget) {
+        self.acid_base_open = false;
+        self.text_buffer.clear();
+        self.text_target = Some(target);
+    }
+    fn calculate_acid_base(&mut self, target: TextTarget, input: &str) {
+        self.acid_base_chart = None;
+        let parse_fields = |count: usize| -> Result<Vec<f64>, String> {
+            let fields: Vec<&str> = input.split(';').map(str::trim).collect();
+            if fields.len() != count {
+                return Err(format!("Enter exactly {count} semicolon-separated values"));
+            }
+            fields
+                .iter()
+                .map(|field| {
+                    field
+                        .replace(',', ".")
+                        .parse::<f64>()
+                        .map_err(|_| format!("Invalid numeric value: {field}"))
+                })
+                .collect()
+        };
+        let parse_pkas = |text: &str| -> Result<Vec<f64>, String> {
+            text.split('|')
+                .map(|value| {
+                    value
+                        .trim()
+                        .replace(',', ".")
+                        .parse::<f64>()
+                        .map_err(|_| format!("Invalid pKa value: {value}"))
+                })
+                .collect()
+        };
+        let result = (|| -> Result<String, String> {
+            match target {
+                TextTarget::BufferPh => {
+                    let v = parse_fields(3)?;
+                    let ph = acid_base::buffer_ph(v[0], v[1], v[2])?;
+                    Ok(format!(
+                        "Buffer pH = {ph:.4}\n\npKa = {:.4}\n[HA] = {:.6} mol/L\n[A⁻] = {:.6} mol/L\nMethod: Henderson–Hasselbalch, pH = pKa + log₁₀([A⁻]/[HA]). Aqueous ideal-solution calculation.",
+                        v[0], v[1], v[2]
+                    ))
+                }
+                TextTarget::PkaFromBuffer => {
+                    let v = parse_fields(3)?;
+                    let pka = acid_base::pka_from_buffer(v[0], v[1], v[2])?;
+                    Ok(format!(
+                        "pKa = {pka:.4}\n\nMeasured pH = {:.4}\n[HA] = {:.6} mol/L\n[A⁻] = {:.6} mol/L\nMethod: rearranged Henderson–Hasselbalch. This derives a pKa from supplied measurement data; it is not a structure-based prediction.",
+                        v[0], v[1], v[2]
+                    ))
+                }
+                TextTarget::WeakAcidPh => {
+                    let v = parse_fields(2)?;
+                    let ph = acid_base::weak_acid_ph(v[0], v[1])?;
+                    Ok(format!(
+                        "Weak-acid pH = {ph:.4}\n\npKa = {:.4}\nInitial concentration = {:.6} mol/L\nMethod: ideal aqueous monoprotic equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C.",
+                        v[0], v[1]
+                    ))
+                }
+                TextTarget::WeakBasePh => {
+                    let v = parse_fields(2)?;
+                    let ph = acid_base::weak_base_ph(v[0], v[1])?;
+                    Ok(format!(
+                        "Weak-base pH = {ph:.4}\n\npKa of BH⁺ = {:.4}\nInitial base concentration = {:.6} mol/L\nMethod: ideal aqueous conjugate-acid equilibrium solved by charge balance, including water autoionization; Kw = 1.0×10⁻¹⁴ at 25 °C.",
+                        v[0], v[1]
+                    ))
+                }
+                TextTarget::StrongMixturePh => {
+                    let v = parse_fields(2)?;
+                    let ph = acid_base::strong_mixture_ph(v[0], v[1])?;
+                    Ok(format!(
+                        "Strong acid/base mixture pH = {ph:.4}\n\nFinal strong-acid concentration = {:.6} mol/L\nFinal strong-base concentration = {:.6} mol/L\nMethod: neutralization and water ion balance, Kw = 1.0×10⁻¹⁴ at 25 °C. Enter concentrations after any volume change.",
+                        v[0], v[1]
+                    ))
+                }
+                TextTarget::PolyproticSpeciation => {
+                    let (pka_text, ph_text) = input
+                        .split_once(';')
+                        .ok_or("Separate the pKa list and pH with a semicolon")?;
+                    let pkas = parse_pkas(pka_text)?;
+                    let ph: f64 = ph_text
+                        .trim()
+                        .replace(',', ".")
+                        .parse()
+                        .map_err(|_| "Invalid pH value")?;
+                    let fractions = acid_base::polyprotic_fractions(ph, &pkas)?;
+                    let n = pkas.len();
+                    let rows = fractions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, fraction)| {
+                            let lost = index;
+                            let formula = if lost == 0 {
+                                if n == 1 {
+                                    "HA".to_string()
+                                } else {
+                                    format!("H{n}A")
+                                }
+                            } else if lost == n {
+                                format!("A{}−", charge_suffix(lost))
+                            } else {
+                                let hydrogen_count = n - lost;
+                                let hydrogen = if hydrogen_count == 1 {
+                                    "H".to_string()
+                                } else {
+                                    format!("H{hydrogen_count}")
+                                };
+                                format!("{hydrogen}A{}−", charge_suffix(lost))
+                            };
+                            format!("{formula}: {:.3}%", fraction * 100.0)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Ok(format!(
+                        "Polyprotic acid speciation at pH {ph:.3}\n\npKa values: {}\n\n{rows}\n\nMethod: successive ideal aqueous dissociation equilibria; fractions sum to 100%.",
+                        pkas.iter().map(|pka| format!("{pka:.3}")).collect::<Vec<_>>().join(", ")
+                    ))
+                }
+                TextTarget::BjerrumDiagram => {
+                    let fields: Vec<&str> = input.split(';').map(str::trim).collect();
+                    if fields.len() != 4 {
+                        return Err("Enter pKa-list; pH-min; pH-max; step".into());
+                    }
+                    let pkas = parse_pkas(fields[0])?;
+                    let numbers = fields[1..]
+                        .iter()
+                        .map(|field| {
+                            field
+                                .replace(',', ".")
+                                .parse::<f64>()
+                                .map_err(|_| format!("Invalid numeric value: {field}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let points =
+                        acid_base::bjerrum_points(&pkas, numbers[0], numbers[1], numbers[2])?;
+                    self.acid_base_chart = Some(ChemistryChart {
+                        title: localized(self.language, "Bjerrum diagram · species distribution")
+                            .into_owned(),
+                        x_label: "pH".into(),
+                        y_label: localized(self.language, "Fraction (%)").into_owned(),
+                        series: (0..=pkas.len()).map(|index| format!("α{index}")).collect(),
+                        points: points
+                            .iter()
+                            .map(|(ph, fractions)| {
+                                (
+                                    *ph,
+                                    fractions.iter().map(|fraction| fraction * 100.0).collect(),
+                                )
+                            })
+                            .collect(),
+                    });
+                    let mut output = format!(
+                        "Bjerrum distribution table\npKa: {}\n\n",
+                        pkas.iter()
+                            .map(|pka| format!("{pka:.3}"))
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    );
+                    output.push_str("pH");
+                    for index in 0..=pkas.len() {
+                        output.push_str(&format!("\tα{index} (%)"));
+                    }
+                    for (ph, fractions) in points {
+                        output.push_str(&format!("\n{ph:.2}"));
+                        for fraction in fractions {
+                            output.push_str(&format!("\t{:.2}", fraction * 100.0));
+                        }
+                    }
+                    output.push_str("\n\nEach α is the fraction of one successive protonation state. Ideal aqueous model; supplied pKa values are not predicted.");
+                    Ok(output)
+                }
+                TextTarget::PolyproticTitrationPh => {
+                    let fields: Vec<&str> = input.split(';').map(str::trim).collect();
+                    if fields.len() != 5 {
+                        return Err(
+                            "Enter pKa-list; acid-volume-mL; acid-M; base-M; added-base-volume-mL"
+                                .into(),
+                        );
+                    }
+                    let pkas = parse_pkas(fields[0])?;
+                    let values = fields[1..]
+                        .iter()
+                        .map(|field| {
+                            field
+                                .replace(',', ".")
+                                .parse::<f64>()
+                                .map_err(|_| format!("Invalid numeric value: {field}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let ph = acid_base::polyprotic_titration_ph(
+                        &pkas,
+                        values[0] / 1000.0,
+                        values[1],
+                        values[2],
+                        values[3] / 1000.0,
+                    )?;
+                    Ok(format!(
+                        "Titration pH = {ph:.4}\n\npKa values: {}\nInitial acid: {:.3} mL × {:.6} mol/L\nAdded strong base: {:.3} mL × {:.6} mol/L\nMethod: polyprotic distribution plus electroneutrality after dilution; ideal aqueous conditions, 25 °C.",
+                        pkas.iter().map(|pka| format!("{pka:.3}")).collect::<Vec<_>>().join(", "),
+                        values[0], values[1], values[3], values[2]
+                    ))
+                }
+                TextTarget::PolyproticTitrationCurve => {
+                    let fields: Vec<&str> = input.split(';').map(str::trim).collect();
+                    if fields.len() != 5 {
+                        return Err(
+                            "Enter pKa-list; acid-volume-mL; acid-M; base-M; max-equivalents"
+                                .into(),
+                        );
+                    }
+                    let pkas = parse_pkas(fields[0])?;
+                    let values = fields[1..]
+                        .iter()
+                        .map(|field| {
+                            field
+                                .replace(',', ".")
+                                .parse::<f64>()
+                                .map_err(|_| format!("Invalid numeric value: {field}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let curve = acid_base::polyprotic_titration_curve(
+                        &pkas,
+                        values[0] / 1000.0,
+                        values[1],
+                        values[2],
+                        values[3],
+                        41,
+                    )?;
+                    self.acid_base_chart = Some(ChemistryChart {
+                        title: localized(self.language, "Polyprotic acid · titration curve")
+                            .into_owned(),
+                        x_label: localized(self.language, "Added strong base (mL)").into_owned(),
+                        y_label: "pH".into(),
+                        series: vec!["pH".into()],
+                        points: curve
+                            .iter()
+                            .map(|(volume, ph)| (volume * 1000.0, vec![*ph]))
+                            .collect(),
+                    });
+                    let mut output = format!(
+                        "Titration curve points\npKa values: {}\n\nV(base), mL\tpH",
+                        pkas.iter()
+                            .map(|pka| format!("{pka:.3}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    for (volume, ph) in curve {
+                        output.push_str(&format!("\n{:.4}\t{ph:.4}", volume * 1000.0));
+                    }
+                    output.push_str("\n\nMethod: equilibrium charge balance for a polyprotic acid titrated with a strong base; ideal aqueous conditions, 25 °C. Table values can be plotted externally.");
+                    Ok(output)
+                }
+                _ => Err("This is not an acid/base calculation input".into()),
+            }
+        })();
+        self.info_overlay = Some(match result {
+            Ok(report) => localize_acid_base_report(self.language, report),
+            Err(error) => format!("Acid/base calculation unavailable\n{error}"),
+        });
+        if self
+            .info_overlay
+            .as_deref()
+            .is_some_and(|report| report.starts_with("Acid/base calculation unavailable"))
+        {
+            self.acid_base_chart = None;
+        }
+        self.info_scroll = 0;
+    }
+    fn apply_molecule_property_edit(&mut self, input: &str) {
+        let input = input.trim();
+        if let Some(key) = input.strip_prefix('-') {
+            let key = key.trim();
+            if !valid_property_key(key) {
+                self.status = "Use -KEY to remove a valid data key".into();
+                return;
+            }
+            let found = self
+                .mol
+                .properties
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
+                || (key.eq_ignore_ascii_case("name") && !self.mol.name.is_empty());
+            if !found {
+                self.status = format!("No molecule data field named {key}");
+                return;
+            }
+            self.checkpoint();
+            self.mol
+                .properties
+                .retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+            if key.eq_ignore_ascii_case("name") {
+                self.mol.name.clear();
+            }
+            self.status = format!("Removed molecule data field {key}");
+            return;
+        }
+        let Some((key, value)) = input.split_once('=') else {
+            self.status = "Enter KEY=VALUE to save a field, or -KEY to remove it".into();
+            return;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if !valid_property_key(key)
+            || value.is_empty()
+            || value.len() > 2048
+            || value.chars().any(char::is_control)
+        {
+            self.status = "Data key must use letters, digits, '_' or '-'; value must be 1–2048 printable characters".into();
+            return;
+        }
+        self.checkpoint();
+        if key.eq_ignore_ascii_case("name") {
+            self.mol.name = value.to_string();
+        }
+        self.mol
+            .properties
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+        self.mol
+            .properties
+            .push((key.to_string(), value.to_string()));
+        self.status = format!("Saved molecule data field {key}");
+    }
+    fn start_auto_atom_mapping(&mut self, mode: &str) {
+        if self.refuse_overlapping_worker() {
+            return;
+        }
+        let selected: BTreeSet<usize> = self.selected_atoms.iter().copied().collect();
+        if selected.is_empty() {
+            self.info_overlay = Some("Select every complete reactant and product component in one reaction step, then run atom mapping. Leave agents unselected.".into());
+            return;
+        }
+        let chosen: Vec<Vec<usize>> = molecule_components(&self.mol)
+            .into_iter()
+            .filter(|component| component.iter().any(|atom| selected.contains(atom)))
+            .collect();
+        if chosen.is_empty()
+            || chosen
+                .iter()
+                .any(|component| component.iter().any(|atom| !selected.contains(atom)))
+        {
+            self.info_overlay = Some("Automatic mapping requires whole connected components. Select every reactant/product component you want mapped, and leave agents unselected.".into());
+            return;
+        }
+        let mut source = Vec::new();
+        let mut target = Vec::new();
+        let mut reaction_steps = BTreeSet::new();
+        for component in &chosen {
+            let roles: BTreeSet<&str> = component
+                .iter()
+                .map(|&i| self.mol.atoms[i].reaction_role.as_deref().unwrap_or(""))
+                .collect();
+            let steps: BTreeSet<u16> = component
+                .iter()
+                .map(|&i| self.mol.atoms[i].reaction_step)
+                .collect();
+            if roles == BTreeSet::from(["reactant"]) {
+                source.extend(component.iter().copied());
+            } else if roles == BTreeSet::from(["product"]) {
+                target.extend(component.iter().copied());
+            } else {
+                self.info_overlay = Some("Every selected component must have one explicit role: reactant or product. Leave agents unselected and set roles in Insert → Reaction component.".into());
+                return;
+            }
+            if steps.len() != 1 {
+                self.info_overlay =
+                    Some("A connected component cannot span multiple reaction steps.".into());
+                return;
+            }
+            reaction_steps.extend(steps);
+        }
+        if source.is_empty() || target.is_empty() {
+            self.info_overlay = Some(
+                "Select at least one explicitly assigned reactant and one product component."
+                    .into(),
+            );
+            return;
+        }
+        if reaction_steps.len() != 1 {
+            self.info_overlay = Some(
+                "All selected reactant and product components must belong to the same reaction step.".into(),
+            );
+            return;
+        }
+        let invalid = |indices: &[usize]| {
+            indices.iter().any(|&i| {
+                let a = &self.mol.atoms[i];
+                a.alias.is_some()
+                    || a.query.is_some()
+                    || a.r_group.is_some()
+                    || !chemistry::valid_element(&a.element)
+            }) || self.mol.bonds.iter().any(|b| {
+                indices.contains(&b.a)
+                    && indices.contains(&b.b)
+                    && (b.query.is_some()
+                        || b.style != BondStyle::Normal && b.style != BondStyle::Aromatic)
+            })
+        };
+        if source.len() > 999 || target.len() > 999 || invalid(&source) || invalid(&target) {
+            self.info_overlay = Some("This optional mapping bridge accepts up to 999 atoms per reaction side. Query atoms, aliases, R-groups and special stereobonds are refused so they are not silently lost.".into());
+            return;
+        }
+        let component_mol = |indices: &[usize]| {
+            let mut component = Molecule::default();
+            let mut remap = BTreeMap::new();
+            for &old in indices {
+                remap.insert(old, component.atoms.len());
+                component.atoms.push(self.mol.atoms[old].clone());
+            }
+            component.bonds = self
+                .mol
+                .bonds
+                .iter()
+                .filter_map(|bond| {
+                    Some(Bond {
+                        a: *remap.get(&bond.a)?,
+                        b: *remap.get(&bond.b)?,
+                        ..bond.clone()
+                    })
+                })
+                .collect();
+            component
+        };
+        let source_mol = component_mol(&source);
+        let target_mol = component_mol(&target);
+        let source_block = molfile_for(&source_mol);
+        let target_block = molfile_for(&target_mol);
+        let captured = self.mol.clone();
+        let source_indices = source;
+        let target_indices = target;
+        let operation_mode = mode.to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(rdkit::map_reaction_pair(&source_block, &target_block));
+        });
+        self.calc_rx = Some((captured, rx));
+        self.auto_map_pending = Some((source_indices, target_indices, operation_mode.clone()));
+        self.info_overlay = Some(format!("Running optional AtomMapper for all selected components in this reaction step ({operation_mode} maps)…"));
+        self.info_scroll = 0;
+        self.status = "Mapping selected reaction components…".into();
+    }
+
+    fn apply_auto_atom_mapping(
+        &mut self,
+        report: &str,
+        source: &[usize],
+        target: &[usize],
+        mode: &str,
+    ) {
+        let mut pairs = Vec::new();
+        let mut optimality = "unknown";
+        let mut engine = "AtomMapper";
+        let mut complete_status = false;
+        let mut malformed = false;
+        for line in report.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["STATUS", "complete"] if !complete_status => complete_status = true,
+                ["OPTIMALITY", value] => optimality = value,
+                ["ENGINE", value] => engine = value,
+                ["PAIR", a, b, changed] => {
+                    match a
+                        .parse::<usize>()
+                        .ok()
+                        .zip(b.parse::<usize>().ok())
+                        .zip(changed.parse::<u8>().ok().filter(|value| *value <= 1))
+                    {
+                        Some(((a, b), changed)) => pairs.push((a, b, changed != 0)),
+                        None => malformed = true,
+                    }
+                }
+                [""] => {}
+                _ => malformed = true,
+            }
+        }
+        if !complete_status
+            || malformed
+            || pairs.is_empty()
+            || pairs
+                .iter()
+                .any(|(a, b, _)| *a >= source.len() || *b >= target.len())
+        {
+            self.info_overlay = Some(
+                "Atom mapping returned an incomplete or invalid result. No atom maps were changed."
+                    .into(),
+            );
+            return;
+        }
+        let mut seen_source = BTreeSet::new();
+        let mut seen_target = BTreeSet::new();
+        if pairs
+            .iter()
+            .any(|(a, b, _)| !seen_source.insert(*a) || !seen_target.insert(*b))
+        {
+            self.info_overlay = Some(
+                "Atom mapping returned duplicate atom correspondences. No atom maps were changed."
+                    .into(),
+            );
+            return;
+        }
+        let selected_atoms: BTreeSet<usize> = source.iter().chain(target).copied().collect();
+        let mut map_ids: BTreeSet<u16> = self
+            .mol
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !selected_atoms.contains(i))
+            .filter_map(|(_, atom)| atom.atom_map)
+            .collect();
+        let mut next = 1u16;
+        let mut assignments = Vec::new();
+        for (a, b, changed) in &pairs {
+            if mode == "Changing" && !changed {
+                continue;
+            }
+            while map_ids.contains(&next) && next < 32767 {
+                next += 1;
+            }
+            if next == 0 || map_ids.contains(&next) {
+                self.info_overlay = Some("No free atom-map numbers remain (maximum is 32767). No atom maps were changed.".into());
+                return;
+            }
+            let id = next;
+            map_ids.insert(id);
+            assignments.push((source[*a], id));
+            assignments.push((target[*b], id));
+        }
+        if mode == "Complete" {
+            let mapped_source: BTreeSet<usize> = assignments.iter().map(|(i, _)| *i).collect();
+            for &atom in source.iter().chain(target) {
+                if mapped_source.contains(&atom) {
+                    continue;
+                }
+                while map_ids.contains(&next) && next < 32767 {
+                    next += 1;
+                }
+                if next == 0 || map_ids.contains(&next) {
+                    self.info_overlay = Some("No free atom-map numbers remain (maximum is 32767). No atom maps were changed.".into());
+                    return;
+                }
+                map_ids.insert(next);
+                assignments.push((atom, next));
+            }
+        }
+        if assignments.is_empty() {
+            self.info_overlay = Some(
+                "The selected mode produced no atom-map assignments. Existing maps were left unchanged."
+                    .into(),
+            );
+            return;
+        }
+        self.checkpoint();
+        for &atom in &selected_atoms {
+            self.mol.atoms[atom].atom_map = None;
+        }
+        for (atom, id) in &assignments {
+            self.mol.atoms[*atom].atom_map = Some(*id);
+        }
+        self.dirty = true;
+        let mapped_pairs = assignments.len() / 2;
+        self.info_overlay = Some(format!("Automatic atom mapping · {mode}\n{engine}\nSearch status: complete · optimality: {optimality}\nMapped pairs: {}\n\nAtomMapper maps shared connected cores across the selected reaction sides and may return a seed-conditioned optimum; a completed search is not proof of the globally best mapping. Changing mode marks atoms at engine-reported atom/bond changes. Unmatched atoms are assigned one-sided IDs only in Complete mode. All selected reactant and product components in this step were processed.", if mode == "Complete" { pairs.len() } else { mapped_pairs }));
+        self.info_scroll = 0;
+        self.status = format!(
+            "Applied {} automatic atom-map pair(s)",
+            if mode == "Complete" {
+                pairs.len()
+            } else {
+                mapped_pairs
+            }
+        );
+    }
+
     fn menu_action(&mut self, cmd: &str) {
         match cmd{
         "New"=>self.new_document(),
         "Open"=>self.file_dialog=Some(false),"Save"=>self.file_dialog=Some(true),"Save all"=>self.save_all(),"Recent files"=>self.recent_open=true,"Close tab"=>self.request_close_document(self.active_document),"Undo"=>self.undo(),"Redo"=>self.redo(),
         "Toggle dark theme"=>self.set_dark_theme(!self.dark_theme),
+        "Show implicit hydrogens"=>self.set_implicit_hydrogen_visibility(!self.show_implicit_hydrogens),
         "Delete selection"=>self.delete_selection(),
         "Duplicate selection"=>self.duplicate_selection(),
         "Rotate selection 90°"=>self.rotate_selection(std::f32::consts::FRAC_PI_2),
         "Select all"=>self.select_all(),
-        "Fit"=>{let w=screen_width();let h=screen_height();let mut points:Vec<Vec2>=self.mol.atoms.iter().map(|a|a.pos).collect();for g in &self.graphics{points.push(match g{Graphic::Arrow{start,end,..}|Graphic::Shape{start,end,..}=>(*start+*end)/2.,Graphic::ElectronArrow{control,..}=>*control,Graphic::Text{pos,..}|Graphic::Plus{pos}=>*pos});}if !points.is_empty(){let(min_x,max_x,min_y,max_y)=points.iter().fold((f32::MAX,f32::MIN,f32::MAX,f32::MIN),|(lx,hx,ly,hy),p|(lx.min(p.x),hx.max(p.x),ly.min(p.y),hy.max(p.y)));let sx=(max_x-min_x).max(BOND);let sy=(max_y-min_y).max(BOND);self.zoom=((w-LEFT-RIGHT-60.)/sx).min((h-TOP-BOTTOM-60.)/sy).clamp(0.2,4.);self.pan=Vec2::ZERO;}},
+        "Fit"=>{let w=screen_width();let h=screen_height();let mut points:Vec<Vec2>=self.mol.atoms.iter().map(|a|a.pos).collect();for g in &self.graphics{points.push(match g{Graphic::Arrow{start,end,..}|Graphic::Shape{start,end,..}=>(*start+*end)/2.,Graphic::ElectronArrow{control,..}=>*control,Graphic::Text{pos,..}|Graphic::Plus{pos}=>*pos});}if !points.is_empty(){let(min_x,max_x,min_y,max_y)=points.iter().fold((f32::MAX,f32::MIN,f32::MAX,f32::MIN),|(lx,hx,ly,hy),p|(lx.min(p.x),hx.max(p.x),ly.min(p.y),hy.max(p.y)));let sx=(max_x-min_x).max(BOND);let sy=(max_y-min_y).max(BOND);self.zoom=((w-LEFT-RIGHT-60.)/sx).min((h-TOP-BOTTOM-60.)/sy).clamp(0.2,4.);self.preferred_zoom=self.zoom;self.zoom_preference_dirty=true;self.pan=Vec2::ZERO;}},
         "Zoom in"=>self.adjust_zoom(1.2,vec2(screen_width()/2.,screen_height()/2.),screen_width(),screen_height()),
         "Zoom out"=>self.adjust_zoom(1./1.2,vec2(screen_width()/2.,screen_height()/2.),screen_width(),screen_height()),
-        "Elements"=>self.periodic_open=true,"Templates"=>self.templates_open=true,
+        "Elements"=>self.periodic_open=true,"Templates"=>{self.templates_open=true;self.template_tab_custom=false;},
+        "Save selection as template"=>{if self.selected.is_none()&&self.selected_atoms.is_empty(){self.status="Select a connected fragment before saving a template".into();}else{self.templates_open=true;self.template_tab_custom=true;self.text_buffer.clear();self.text_target=Some(TextTarget::TemplateName);}},
+        "Edit molecule data"=>{self.text_buffer.clear();self.text_target=Some(TextTarget::MoleculeProperty);},
         "Arrow"=>{self.tool=Tool::Arrow;self.arrow_kind="reaction".into()},
         "Line"=>self.tool=Tool::Shape(ShapeKind::Line),
         "Rectangle"=>self.tool=Tool::Shape(ShapeKind::Rectangle),
@@ -3325,7 +5950,7 @@ impl Editor {
                         for found in &report.matches{atoms.extend(found.iter().copied());}
                         self.selected_atoms=atoms.into_iter().collect();self.selected=self.selected_atoms.first().copied();
                         let lines=report.matches.iter().take(30).enumerate().map(|(i,found)|format!("{}. target atoms {}",i+1,found.iter().map(|n|(n+1).to_string()).collect::<Vec<_>>().join(", "))).collect::<Vec<_>>().join("\n");
-                        self.info_overlay=Some(format!("{} match(es) · query {} atoms · target {} atoms\n\n{}{}\n\nSelected atoms highlight the matching occurrences. This local matcher supports element/list, aromaticity, hydrogen, connectivity, degree, valence, unsaturation, substitution count, ring-bond count, minimum ring size, deterministic minimum-cycle-basis ring count and bond-order predicates. Ring counts may differ from other toolkits when cycle bases tie; stereochemical matching is not implemented.",report.matches.len(),report.query_atoms,report.target_atoms,lines,if report.matches.len()>30{"\n…showing first 30"}else{""}));
+                        self.info_overlay=Some(format!("{} match(es) · query {} atoms · target {} atoms\n\n{}{}\n\nSelected atoms highlight the matching occurrences. This local matcher supports element/list, aromaticity, hydrogen, connectivity, degree, valence, unsaturation, substitution count, ring-bond count, minimum ring size, deterministic minimum-cycle-basis ring count, bond-order predicates and exact stored R/S and E/Z/cis/trans labels. Ring counts may differ from other toolkits when cycle bases tie; wedge/hash stereochemistry and stereo groups are unsupported.",report.matches.len(),report.query_atoms,report.target_atoms,lines,if report.matches.len()>30{"\n…showing first 30"}else{""}));
                     }
                 },
                 Err(error)=>self.info_overlay=Some(error),
@@ -3333,7 +5958,21 @@ impl Editor {
         },
         "Name structure"=>{self.naming_highlight.clear();self.info_overlay=Some(match naming::name(&self.mol){Ok(n)=>{self.naming_highlight=n.highlighted_atoms.clone();format!("Teaching name: {}\n\n{}",n.name,n.explanation)},Err(e)=>format!("Name unavailable\n{e}")});},
         "Clean 2D"=>self.clean_2d(),
-        "Generate 3D coordinates"=>{if self.mol.atoms.is_empty(){self.info_overlay=Some("Draw or open a molecule before generating 3D coordinates.".into());}else if self.mol.atoms.iter().any(|a|a.query.is_some()||a.r_group.is_some()||!chemistry::valid_element(&a.element)){self.info_overlay=Some("This structure contains query atoms or nonstandard elements that cannot be sent to the RDKit 3D worker.".into());}else{let block=self.molfile();let captured=self.mol.clone();let (tx,rx)=mpsc::channel();std::thread::spawn(move||{let _=tx.send(rdkit::generate_3d(&block));});self.calc_rx=Some((captured,rx));self.info_overlay=Some("Generating 3D coordinates with optional RDKit…".into());}},
+        "Generate 3D coordinates"=>{
+            if self.refuse_overlapping_worker() { return; }
+            if self.mol.atoms.is_empty() {
+                self.info_overlay=Some("Draw or open a molecule before generating 3D coordinates.".into());
+            } else if self.mol.atoms.iter().any(|a|a.query.is_some()||a.r_group.is_some()||!chemistry::valid_element(&a.element)) {
+                self.info_overlay=Some("This structure contains query atoms or nonstandard elements that cannot be sent to the RDKit 3D worker.".into());
+            } else {
+                let block=self.molfile();
+                let captured=self.mol.clone();
+                let (tx,rx)=mpsc::channel();
+                std::thread::spawn(move||{let _=tx.send(rdkit::generate_3d(&block));});
+                self.calc_rx=Some((captured,rx));
+                self.info_overlay=Some("Generating 3D coordinates with optional RDKit…".into());
+            }
+        },
         "3D viewer"=>{if self.mol.atoms.iter().all(|a|a.coord3d.is_some())&&!self.mol.atoms.is_empty(){self.view_3d_open=true;}else{self.info_overlay=Some("No 3D coordinates are stored. Choose Structure → Generate 3D coordinates; that action requires optional RDKit.".into());}},
         "Add explicit hydrogens"=>self.add_explicit_hydrogens(),
         "Remove explicit hydrogens"=>self.remove_explicit_hydrogens(),
@@ -3342,16 +5981,35 @@ impl Editor {
         "Rotate 180"=>self.transform_document(std::f32::consts::PI,false,false),
         "Flip left-right"=>self.transform_document(0.,true,false),
         "Flip up-down"=>self.transform_document(0.,false,true),
-        "Benzene template"=>{self.tool=Tool::Template("Benzene");self.status="Click canvas to place benzene".into();},
+        "Benzene template"=>self.activate_builtin_template("Benzene"),
         "Formula & mass"=>{let a=chemistry::analyze(&self.mol);self.info_overlay=Some(format!("Formula: {}\nMolar mass: {} g/mol\nExact mass: {} Da\nMethod: local valence/H count; CIAAW standard atomic weights (2024), interval midpoint estimates; listed isotope masses and ionic electron correction.\nUnusual valence, query chemistry and unsupported elements may be unresolved.",a.formula,a.molar_mass.map(|x|format!("{x:.3}")).unwrap_or_else(||"unavailable".into()),a.exact_mass.map(|x|format!("{x:.4}")).unwrap_or_else(||"unavailable".into())));},
         "Molecular properties"=>{
             let a=chemistry::analyze(&self.mol);
             let comp=a.composition.iter().map(|(el,n)|format!("{el}: {n}")).collect::<Vec<_>>().join(", ");
             self.info_overlay=Some(format!("Local graph properties\nFormula: {}\nElements: {}\nMolar mass: {} g/mol\nExact mass: {} Da\nAtoms: {} (heavy: {})\nBonds: {}\nConnected components: {}\nCycle rank (E − V + C): {}\nAverage graph degree: {:.2}\nFormal charge: {}\nMethod: graph counts; CIAAW 2024 standard atomic weights (interval midpoints) and explicit isotope masses. Exact ionic mass applies electron mass correction. Cycle rank includes every stored bond, including coordination links.\nlogP, TPSA, pKa, NMR and 3D require a verified chemistry engine.",a.formula,comp,a.molar_mass.map(|x|format!("{x:.3}")).unwrap_or_else(||"unavailable".into()),a.exact_mass.map(|x|format!("{x:.4}")).unwrap_or_else(||"unavailable".into()),a.atom_count,a.heavy_atom_count,a.bond_count,a.connected_components,a.cycle_rank,a.average_degree,a.formal_charge));
         },
+        "Local topological descriptors"=>{
+            self.info_overlay=Some(match chemistry::topological_descriptors(&self.mol) {
+                Ok(d)=>format!("Classical heavy-atom graph descriptors\nHeavy atoms: {}\nHeavy-atom bonds: {}\nWiener index: {}\nGraph diameter: {} bonds\nFirst Zagreb index (M₁): {}\nSecond Zagreb index (M₂): {}\nRandić connectivity index (α = −½): {:.4}\nMethod: shortest-path sum and degree products on the connected heavy-atom graph; explicit hydrogens excluded. These are graph descriptors, not physical property predictions.",d.heavy_atoms,d.heavy_atom_bonds,d.wiener_index,d.diameter,d.first_zagreb,d.second_zagreb,d.randic_connectivity),
+                Err(error)=>format!("Topological descriptors unavailable\n{error}"),
+            });
+        },
         "Reaction analysis"=>self.analyze_reaction(),
+        "Auto-map reaction (Complete)"=>self.start_auto_atom_mapping("Complete"),
+        "Auto-map reaction (Matching)"=>self.start_auto_atom_mapping("Matching"),
+        "Auto-map reaction (Changing)"=>self.start_auto_atom_mapping("Changing"),
+        "Gasteiger partial charges"=>self.start_rdkit_partial_charges(),
         "Auto-balance reaction"=>self.auto_balance_reaction(),
+        "Auto-balance all reaction steps"=>self.auto_balance_all_reactions(),
         "View all reaction steps"=>self.reaction_step_view=None,
+        "View previous reaction step"=>{
+            let count=self.graphics.iter().filter(|g|matches!(g,Graphic::Arrow{kind,..} if kind=="reaction"||kind=="equilibrium"||kind=="retrosynthesis")).count() as u16;
+            if count>0 { let current=self.reaction_step_view.unwrap_or(1).min(count); self.reaction_step_view=Some(current.saturating_sub(1).max(1)); }
+        },
+        "View next reaction step"=>{
+            let count=self.graphics.iter().filter(|g|matches!(g,Graphic::Arrow{kind,..} if kind=="reaction"||kind=="equilibrium"||kind=="retrosynthesis")).count() as u16;
+            if count>0 { let current=self.reaction_step_view.unwrap_or(1).min(count); self.reaction_step_view=Some((current+1).min(count)); }
+        },
         "View reaction step 1"=>self.reaction_step_view=Some(1),
         "View reaction step 2"=>self.reaction_step_view=Some(2),
         "View reaction step 3"=>self.reaction_step_view=Some(3),
@@ -3361,10 +6019,13 @@ impl Editor {
         "Reaction component: automatic role"=>self.set_reaction_component(Some(""),None,None),
         "Reaction coefficient: 2"=>self.set_reaction_component(None,None,Some(2)),
         "Reaction coefficient: 3"=>self.set_reaction_component(None,None,Some(3)),
+        "Reaction coefficient: custom"=>{self.text_buffer.clear();self.text_target=Some(TextTarget::ReactionCoefficient);},
+        "Chemistry A acid/base tools"=>self.acid_base_open=true,
         "Reaction step: 1"=>self.set_reaction_component(None,Some(1),None),
         "Reaction step: 2"=>self.set_reaction_component(None,Some(2),None),
         "Reaction step: 3"=>self.set_reaction_component(None,Some(3),None),
         "RDKit descriptors"=>{
+            if self.refuse_overlapping_worker(){return;}
             if self.mol.atoms.is_empty(){self.info_overlay=Some("Draw a molecule first".into());}
             else if self.mol.atoms.len()>999||self.mol.bonds.len()>999 {self.info_overlay=Some("RDKit bridge currently accepts MOL V2000 (maximum 999 atoms/bonds)".into());}
             else if self.mol.atoms.iter().any(|a|a.query.is_some()||a.r_group.is_some()||a.alias.is_some()||!chemistry::valid_element(&a.element))||self.mol.bonds.iter().any(|b|b.style!=BondStyle::Normal||b.query.is_some()) {self.info_overlay=Some("This structure contains query, R-group, alias, or special bond data that the RDKit MOL bridge cannot preserve. No descriptor was calculated.".into());}
@@ -3372,6 +6033,7 @@ impl Editor {
         },
         "Enumerate tautomers" => self.start_rdkit_chemical_report("tautomer-report"),
         "Enumerate stereoisomers" => self.start_rdkit_chemical_report("stereoisomer-report"),
+        "Fetch PubChem properties" => self.start_pubchem_lookup(),
         "Settings"=>self.settings_open=true,
         "Command palette"=>{self.palette_open=true;self.palette_query.clear();self.palette_selection=0;},
         "Search PubChem in browser"=>{let query=self.mol.name.trim().to_string();let query=if query.is_empty(){self.mol.properties.iter().find(|(key,_)|key.eq_ignore_ascii_case("name")).map(|(_,value)|value.clone()).unwrap_or_else(||chemistry::analyze(&self.mol).formula)}else{query};let url=format!("https://pubchem.ncbi.nlm.nih.gov/#query={}",url_encode(&query));self.status=match open_external_url(&url){Ok(())=>format!("Opened PubChem browser search for {query} (browser search only; no data was retrieved)"),Err(error)=>error};},
@@ -3380,10 +6042,21 @@ impl Editor {
         "Aromatize"=>self.start_rdkit_graph_operation("aromatize"),
         "Kekulé form"=>self.start_rdkit_graph_operation("kekulize"),
         "Stereochemistry report"=>self.start_stereo_report(),
+        "Assign R/S labels with RDKit"=>self.start_stereo_assignment(),
+        "Copy as SMILES"=>self.start_copy_smiles(),
+        "Copy as SMARTS"=>self.start_copy_smarts(),
+        "Copy drawing as image"=>{
+            self.status=match render_png(&self.mol,&self.graphics,1920,1080)
+                .and_then(|png|copy_png_to_clipboard(&png))
+            {
+                Ok(())=>"Copied the 1920×1080 drawing image to the clipboard".into(),
+                Err(error)=>format!("Could not copy drawing image: {error}"),
+            };
+        },
         "Resume lesson"=>{if self.lesson.is_some(){self.lesson_open=true;}else{self.status="Start a lesson from Help first".into();}},
-        "Integration status"=>self.info_overlay=Some("RDKit and Open Babel are not installed.\n3D generation, IUPAC names, advanced descriptors, InChI and broad format conversion are unavailable.\nLocal drawing, MOL and MOLS still work.".into()),
-        "Shortcuts"=>{let m=if cfg!(target_os="macos"){"Cmd"}else{"Ctrl"};self.info_overlay=Some(format!("{m}+N: New | {m}+O: Open | {m}+S: Save | {m}+Z: Undo | {m}+Y: Redo\n{m}+Shift+P: Command palette | Delete: delete selection\nEsc: select tool | Shift+R: six-membered ring\nDrawing buffer: 1/2/3 orders, 4 aromatic, 5 wedge, 6 hash, 7 wavy\nC, N, O, Cl... select element; + and - change selected charge\nR1...R32767 assigns R-group; M1... assigns atom map\n{m}+E opens the periodic table."))},
-        "Quick start guide"=>self.info_overlay=Some("MOLECULA · QUICK START\n\n01  DRAW\nChoose a bond on the left, then drag or click two points. Choose Chain near the top of the tools to draw a zigzag carbon chain.\n\n02  CHANGE ATOMS\nChoose C, N, O or another element below. Click an atom to replace it. Use the periodic table for all elements.\n\n03  BUILD A REACTION\nPlace reactants left and products right. Insert → Arrow draws a reaction arrow. Use Calculations → Reaction analysis when you want formula, molar mass and balance. Use e⁻ tools for curved electron flow.\n\n04  NAME AND CHECK\nStructure → Name structure gives a name in the supported teaching subset. Molecular properties shows formula and mass.\n\n05  SAVE\nFile → Save writes a .mols document with editable chemistry and graphics.\n\nUNDO Cmd/Ctrl+Z   ·   REDO Cmd/Ctrl+Y   ·   DELETE Delete   ·   CANCEL Esc".into()),
+        "Integration status"=>self.info_overlay=Some("PubChem direct structure lookup uses the official NCBI PUG REST API and requires an internet connection plus curl. It sends a locally representable exact structure only after you select Fetch PubChem properties; the drawing is not changed.\n\nRDKit is an optional external Python integration. Without it, 3D generation, local advanced descriptors, stereochemistry assignment and broad format conversion are unavailable. Local drawing, MOL and MOLS still work.".into()),
+        "Shortcuts"=>{let m=if cfg!(target_os="macos"){"Cmd"}else{"Ctrl"};self.info_overlay=Some(format!("{m}+N: New | {m}+O: Open | {m}+S: Save | {m}+Z: Undo | {m}+Y: Redo\n{m}+L: Copy as SMILES | {m}+Shift+K: Copy as SMARTS | {m}+Shift+P: Command palette | Delete: delete selection\nEsc: select tool | Shift+R: six-membered ring\nDrawing buffer: 1/2/3 orders, 4 aromatic, 5 wedge, 6 hash, 7 wavy, 12/14/24 bond queries\nC, N, O, Cl... select element; + and - change selected charge\n@13 sets isotope mass 13 on the selected atom; @0 clears it\nlabel:Ph assigns alias Ph; label:- clears the alias\nR1...R32767 assigns R-group; M1... assigns a map; M0 clears; M+/M= assign unique maps\n{m}+E opens the periodic table."))},
+        "Quick start guide"=>self.info_overlay=Some(quick_start_guide(self.language)),
         "Feature status"=>self.info_overlay=Some("See STATUS.md in the source folder for implemented, partial and unavailable functions.".into()),
         _=>{}
     }
@@ -3441,6 +6114,28 @@ impl Editor {
                     self.status = "Select an atom before assigning a map number".into();
                 }
             }
+            AssignUniqueAtomMaps => self.assign_unique_atom_maps(),
+            Isotope(mass) => {
+                if let Some(i) = self.selected.filter(|i| *i < self.mol.atoms.len()) {
+                    if self.mol.atoms[i].isotope != mass {
+                        self.checkpoint();
+                        self.mol.atoms[i].isotope = mass;
+                    }
+                } else {
+                    self.status =
+                        "Select an atom before assigning an isotope (type @0 to clear)".into();
+                }
+            }
+            Alias(alias) => {
+                if let Some(i) = self.selected.filter(|i| *i < self.mol.atoms.len()) {
+                    if self.mol.atoms[i].alias != alias {
+                        self.checkpoint();
+                        self.mol.atoms[i].alias = alias;
+                    }
+                } else {
+                    self.status = "Select an atom before assigning an alias (type label:Ph)".into();
+                }
+            }
             Query(q) => {
                 if let Some(i) = self.selected {
                     match shortcuts::merge_query_terms(self.mol.atoms[i].query.as_deref(), &q) {
@@ -3471,25 +6166,18 @@ impl Editor {
         for b in &self.mol.bonds {
             let a = self.mol.atoms[b.a].pos;
             let c = self.mol.atoms[b.b].pos;
-            let d = (c - a).normalize_or_zero();
-            let q = vec2(-d.y, d.x);
-            if b.style == BondStyle::Wedge {
-                s += &format!(
-                    "<polygon points=\"{},{} {},{} {},{}\" fill=\"#222\"/>",
-                    a.x,
-                    a.y,
-                    c.x + q.x * 6.,
-                    c.y + q.y * 6.,
-                    c.x - q.x * 6.,
-                    c.y - q.y * 6.
-                );
-                continue;
-            }
-            for k in 0..b.order.min(3) {
-                let offset = (k as f32 - (b.order as f32 - 1.) / 2.) * 5.;
-                let p = a + q * offset;
-                let r = c + q * offset;
-                s+=&format!("<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#222\" stroke-width=\"2\"/>",p.x,p.y,r.x,r.y);
+            for primitive in export_bond_primitives(a, c, b, 1.) {
+                match primitive {
+                    BondPrimitive::Line(p, q) => {
+                        s += &format!("<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#222\" stroke-width=\"2\"/>", p.x, p.y, q.x, q.y);
+                    }
+                    BondPrimitive::Triangle(p1, p2, p3) => {
+                        s += &format!(
+                            "<polygon points=\"{},{} {},{} {},{}\" fill=\"#222\"/>",
+                            p1.x, p1.y, p2.x, p2.y, p3.x, p3.y
+                        );
+                    }
+                }
             }
         }
         for (i, a) in self.mol.atoms.iter().enumerate() {
@@ -3650,6 +6338,78 @@ fn export_transform(p: Vec2, b: (f32, f32, f32, f32), width: f32, height: f32) -
     let scale = ((width - 80.) / (b.1 - b.0).max(1.)).min((height - 80.) / (b.3 - b.2).max(1.));
     vec2((p.x - b.0) * scale + 40., (p.y - b.2) * scale + 40.)
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BondPrimitive {
+    Line(Vec2, Vec2),
+    Triangle(Vec2, Vec2, Vec2),
+}
+fn export_bond_primitives(a: Vec2, b: Vec2, bond: &Bond, scale: f32) -> Vec<BondPrimitive> {
+    let d = (b - a).normalize_or_zero();
+    let q = vec2(-d.y, d.x);
+    let unit = scale.max(0.01);
+    let line = |start, end| BondPrimitive::Line(start, end);
+    match bond.style {
+        BondStyle::Normal => {
+            let count = bond.order.clamp(1, 3);
+            (0..count)
+                .map(|k| {
+                    let offset = (k as f32 - (count as f32 - 1.) / 2.) * 5. * unit;
+                    line(a + q * offset, b + q * offset)
+                })
+                .collect()
+        }
+        BondStyle::Aromatic => {
+            let mut primitives = vec![line(a, b)];
+            let offset = 5. * unit;
+            for k in 0..8 {
+                let start = a.lerp(b, k as f32 / 8.) + q * offset;
+                let end = a.lerp(b, (k as f32 + 0.55) / 8.) + q * offset;
+                primitives.push(line(start, end));
+            }
+            primitives
+        }
+        BondStyle::Wedge => vec![BondPrimitive::Triangle(
+            a,
+            b + q * (6. * unit),
+            b - q * (6. * unit),
+        )],
+        BondStyle::Hash => (0..11)
+            .map(|k| {
+                let t = (k as f32 + 1.) / 11.;
+                let center = a.lerp(b, t);
+                let half_width = 6. * unit * t;
+                line(center - q * half_width, center + q * half_width)
+            })
+            .collect(),
+        BondStyle::Wavy => {
+            let mut primitives = Vec::with_capacity(24);
+            let mut previous = a;
+            for k in 1..=24 {
+                let t = k as f32 / 24.;
+                let current = a.lerp(b, t) + q * (t * std::f32::consts::TAU * 4.).sin() * 3. * unit;
+                primitives.push(line(previous, current));
+                previous = current;
+            }
+            primitives
+        }
+        BondStyle::Coordinate => {
+            let head = 10. * unit;
+            let half = 4. * unit;
+            vec![
+                line(a, b),
+                line(b, b - d * head + q * half),
+                line(b, b - d * head - q * half),
+            ]
+        }
+        BondStyle::Any => (0..8)
+            .map(|k| {
+                let start = a.lerp(b, k as f32 / 8.);
+                let end = a.lerp(b, (k as f32 + 0.55) / 8.);
+                line(start, end)
+            })
+            .collect(),
+    }
+}
 fn raster_line(image: &mut image::RgbaImage, a: Vec2, b: Vec2, color: image::Rgba<u8>, thick: i32) {
     let (mut x0, mut y0, x1, y1) = (
         a.x.round() as i32,
@@ -3741,17 +6501,25 @@ fn render_png(
         };
         let aa = point(a.pos);
         let cc = point(c.pos);
-        let d = (cc - aa).normalize_or_zero();
-        let q = vec2(-d.y, d.x);
-        for k in 0..bond.order.min(3) {
-            let offset = (k as f32 - (bond.order.min(3) as f32 - 1.) / 2.) * 4. * sx;
-            raster_line(
-                &mut image,
-                aa + q * offset,
-                cc + q * offset,
-                image::Rgba([45, 53, 48, 255]),
-                1,
-            );
+        for primitive in export_bond_primitives(aa, cc, bond, sx.min(sy)) {
+            match primitive {
+                BondPrimitive::Line(start, end) => {
+                    raster_line(&mut image, start, end, image::Rgba([45, 53, 48, 255]), 1);
+                }
+                BondPrimitive::Triangle(p1, p2, p3) => {
+                    let steps = ((p2 - p1).length().max((p3 - p1).length()) * 1.5).ceil() as usize;
+                    for step in 0..=steps {
+                        let t = step as f32 / steps.max(1) as f32;
+                        raster_line(
+                            &mut image,
+                            p1.lerp(p2, t),
+                            p1.lerp(p3, t),
+                            image::Rgba([45, 53, 48, 255]),
+                            0,
+                        );
+                    }
+                }
+            }
         }
     }
     for (i, a) in mol.atoms.iter().enumerate() {
@@ -3880,13 +6648,18 @@ fn render_pdf(mol: &Molecule, graphics: &[Graphic], width: f32, height: f32) -> 
         if let (Some(a), Some(c)) = (mol.atoms.get(b.a), mol.atoms.get(b.b)) {
             let aa = point(a.pos);
             let cc = point(c.pos);
-            let d = (cc - aa).normalize_or_zero();
-            let q = vec2(-d.y, d.x);
-            for k in 0..b.order.min(3) {
-                let off = (k as f32 - (b.order.min(3) as f32 - 1.) / 2.) * 4.;
-                let u = aa + q * off;
-                let v = cc + q * off;
-                stream += &format!("{:.2} {:.2} m {:.2} {:.2} l S\n", u.x, u.y, v.x, v.y);
+            for primitive in export_bond_primitives(aa, cc, b, 1.) {
+                match primitive {
+                    BondPrimitive::Line(start, end) => {
+                        stream += &format!(
+                            "{:.2} {:.2} m {:.2} {:.2} l S\n",
+                            start.x, start.y, end.x, end.y
+                        );
+                    }
+                    BondPrimitive::Triangle(p1, p2, p3) => {
+                        stream += &format!("0.12 0.16 0.13 rg\n{:.2} {:.2} m {:.2} {:.2} l {:.2} {:.2} l h f\n0.12 0.16 0.13 RG\n", p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
+                    }
+                }
             }
         }
     }
@@ -4016,11 +6789,40 @@ fn charge_label(c: i8) -> String {
         x => format!("{}-", -x),
     }
 }
+fn charge_suffix(charge: usize) -> &'static str {
+    match charge {
+        0 | 1 => "",
+        2 => "²",
+        3 => "³",
+        4 => "⁴",
+        5 => "⁵",
+        6 => "⁶",
+        _ => "ⁿ",
+    }
+}
 fn show_label(m: &Molecule, i: usize) -> bool {
     let a = &m.atoms[i];
     a.element != "C"
+        || a.alias.is_some()
         || a.charge != 0
         || m.bonds.iter().filter(|b| b.a == i || b.b == i).count() == 0
+}
+fn atom_display_label(atom: &Atom, implicit_hydrogens: Option<u8>, show_implicit: bool) -> String {
+    let mut label = format!(
+        "{}{}",
+        atom.isotope.map(|n| n.to_string()).unwrap_or_default(),
+        atom.alias.as_ref().unwrap_or(&atom.element)
+    );
+    if show_implicit && atom.alias.is_none() {
+        if let Some(count) = implicit_hydrogens.filter(|count| *count > 0) {
+            label.push('H');
+            if count > 1 {
+                label.push_str(&count.to_string());
+            }
+        }
+    }
+    label.push_str(&charge_label(atom.charge));
+    label
 }
 fn distance_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     let d = b - a;
@@ -4028,23 +6830,105 @@ fn distance_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     p.distance(a + d * t)
 }
 fn project_3d(point: Vec3, center: Vec3, rotation: Vec2, scale: f32, origin: Vec2) -> Vec2 {
-    let p = point - center;
+    let p = rotate_3d(point - center, rotation);
+    origin + vec2(p.x, -p.y) * scale
+}
+fn rotate_3d(p: Vec3, rotation: Vec2) -> Vec3 {
     let (sy, cy) = rotation.x.sin_cos();
     let (sx, cx) = rotation.y.sin_cos();
     let x = p.x * cy - p.z * sy;
     let z = p.x * sy + p.z * cy;
     let y = p.y * cx - z * sx;
-    origin + vec2(x, -y) * scale
+    let rotated_z = p.y * sx + z * cx;
+    vec3(x, y, rotated_z)
+}
+const THREE_D_STYLE_COUNT: u8 = 5;
+fn three_d_style_name(style: u8, language: Language) -> &'static str {
+    let names = if language == Language::Danish {
+        [
+            "Trådmodel",
+            "Pinde",
+            "Kugle og pind",
+            "Rumfyldning",
+            "Monokrom",
+        ]
+    } else {
+        [
+            "Wireframe",
+            "Sticks",
+            "Ball & stick",
+            "Spacefill",
+            "Monochrome",
+        ]
+    };
+    names[usize::from(style.min(THREE_D_STYLE_COUNT - 1))]
+}
+fn three_d_atom_radius(style: u8, element: &str, scale: f32) -> f32 {
+    match style {
+        0 => 2.5,
+        1 => {
+            if element == "C" {
+                3.5
+            } else {
+                7.
+            }
+        }
+        3 => (van_der_waals_radius(element) * scale * 0.55).clamp(7., 90.),
+        _ => 13.,
+    }
+}
+fn three_d_atom_color(style: u8, element: &str) -> Color {
+    if style == 4 {
+        Color::from_rgba(157, 190, 169, 255)
+    } else {
+        element_color(element)
+    }
+}
+fn three_d_bond_color(style: u8) -> Color {
+    match style {
+        0 => Color::from_rgba(120, 145, 132, 180),
+        4 => Color::from_rgba(98, 142, 116, 220),
+        _ => Color::from_rgba(75, 84, 78, 255),
+    }
 }
 fn element_color(element: &str) -> Color {
     match element {
-        "O" => Color::from_rgba(224, 74, 66, 255),
-        "N" => Color::from_rgba(62, 120, 222, 255),
-        "S" => Color::from_rgba(234, 188, 57, 255),
-        "Cl" | "F" => Color::from_rgba(76, 173, 102, 255),
-        "P" => Color::from_rgba(229, 136, 57, 255),
-        "H" => Color::from_rgba(215, 221, 218, 255),
-        _ => Color::from_rgba(65, 76, 70, 255),
+        "H" => Color::from_rgba(255, 255, 255, 255),
+        "C" => Color::from_rgba(144, 144, 144, 255),
+        "N" => Color::from_rgba(48, 80, 248, 255),
+        "O" => Color::from_rgba(255, 13, 13, 255),
+        "F" | "Cl" => Color::from_rgba(31, 240, 31, 255),
+        "Br" => Color::from_rgba(166, 41, 41, 255),
+        "I" => Color::from_rgba(148, 0, 148, 255),
+        "S" => Color::from_rgba(255, 200, 50, 255),
+        "P" => Color::from_rgba(255, 128, 0, 255),
+        "B" => Color::from_rgba(255, 181, 181, 255),
+        "Si" => Color::from_rgba(240, 200, 160, 255),
+        "Na" | "K" | "Li" | "Rb" | "Cs" => Color::from_rgba(171, 92, 242, 255),
+        "Ca" | "Mg" | "Ba" | "Sr" => Color::from_rgba(61, 255, 0, 255),
+        "Fe" | "Cu" | "Co" | "Ni" | "Mn" | "Cr" => Color::from_rgba(224, 102, 51, 255),
+        "Zn" | "Cd" | "Hg" => Color::from_rgba(125, 128, 176, 255),
+        "Al" | "Ga" | "In" | "Sn" | "Pb" => Color::from_rgba(191, 166, 166, 255),
+        _ => Color::from_rgba(140, 145, 142, 255),
+    }
+}
+fn van_der_waals_radius(element: &str) -> f32 {
+    match element {
+        "H" => 1.20,
+        "C" => 1.70,
+        "N" => 1.55,
+        "O" => 1.52,
+        "F" => 1.47,
+        "P" | "S" => 1.80,
+        "Cl" => 1.75,
+        "Br" => 1.85,
+        "I" => 1.98,
+        "He" => 1.40,
+        "Ne" => 1.54,
+        "Ar" => 1.88,
+        "Kr" => 2.02,
+        "Xe" => 2.16,
+        _ => 1.80,
     }
 }
 fn v3000_query_attributes(query: Option<&str>) -> (Vec<String>, bool) {
@@ -4333,7 +7217,7 @@ fn split_v3000_tokens(record: &str) -> Vec<String> {
 fn molfile_for(mol: &Molecule) -> String {
     if mol_uses_v3000(mol) {
         let has_3d = !mol.atoms.is_empty() && mol.atoms.iter().all(|a| a.coord3d.is_some());
-        let mut s = format!("{}\n  Molecula\n\n  0  0  0     0  0            V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS {} {} 0 0 0\nM  V30 BEGIN ATOM\n", if has_3d {"MOLECULA_3D"} else {"Molecula"}, mol.atoms.len(), mol.bonds.len());
+        let mut s = format!("{}\n  Molecula\n\n  0  0  0  0  0  0  0  0  0  0999 V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS {} {} 0 0 0\nM  V30 BEGIN ATOM\n", if has_3d {"MOLECULA_3D"} else {"Molecula"}, mol.atoms.len(), mol.bonds.len());
         for (i, a) in mol.atoms.iter().enumerate() {
             let (atom_type, _) = v3000_atom_type(a);
             let atom_type = if atom_type.chars().any(char::is_whitespace) {
@@ -4386,7 +7270,10 @@ fn molfile_for(mol: &Molecule) -> String {
                 attrs
             );
         }
-        s += "M  V30 END ATOM\nM  V30 BEGIN BOND\n";
+        s += "M  V30 END ATOM\n";
+        if !mol.bonds.is_empty() {
+            s += "M  V30 BEGIN BOND\n";
+        }
         for (i, b) in mol.bonds.iter().enumerate() {
             let (bond_type, attrs, _) = v3000_bond_attributes(b);
             s += &format!(
@@ -4399,7 +7286,10 @@ fn molfile_for(mol: &Molecule) -> String {
                 attrs.join(" ")
             );
         }
-        s += "M  V30 END BOND\nM  V30 END CTAB\nM  END\n";
+        if !mol.bonds.is_empty() {
+            s += "M  V30 END BOND\n";
+        }
+        s += "M  V30 END CTAB\nM  END\n";
         return s;
     }
     let has_3d = !mol.atoms.is_empty() && mol.atoms.iter().all(|a| a.coord3d.is_some());
@@ -4433,8 +7323,14 @@ fn molfile_for(mol: &Molecule) -> String {
             .valence_override
             .filter(|v| *v <= 14)
             .map(|v| if v == 0 { 15 } else { v });
+        // In V2000, an unset atom map is represented by a blank field. Writing
+        // zero creates an explicit map number 0 in RDKit and exported SMILES.
+        let atom_map = a
+            .atom_map
+            .map(|map| format!("{map:>3}"))
+            .unwrap_or_else(|| "   ".to_string());
         s += &format!(
-            "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0 {:>1} {:>1}  0  0 {:>2}  0  0 {:>3}  0  0\n",
+            "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0 {:>1} {:>1}  0  0 {:>2}  0  0  {}  0  0\n",
             x,
             y,
             z,
@@ -4447,7 +7343,7 @@ fn molfile_for(mol: &Molecule) -> String {
             },
             h_count,
             valence.unwrap_or(0),
-            a.atom_map.unwrap_or(0)
+            atom_map
         );
     }
     for b in &mol.bonds {
@@ -5430,6 +8326,9 @@ fn menu_items(i: usize) -> &'static [&'static str] {
         1 => &[
             "Undo",
             "Redo",
+            "Copy as SMILES",
+            "Copy as SMARTS",
+            "Copy drawing as image",
             "Delete selection",
             "Duplicate selection",
             "Rotate selection 90°",
@@ -5442,9 +8341,11 @@ fn menu_items(i: usize) -> &'static [&'static str] {
             "Zoom out",
             "Elements",
             "Toggle dark theme",
+            "Show implicit hydrogens",
         ],
         3 => &[
             "Templates",
+            "Save selection as template",
             "Arrow",
             "Equilibrium arrow",
             "Resonance arrow",
@@ -5453,6 +8354,7 @@ fn menu_items(i: usize) -> &'static [&'static str] {
             "Single electron arrow",
             "Plus",
             "Text",
+            "Edit molecule data",
             "Line",
             "Rectangle",
             "Ellipse",
@@ -5465,10 +8367,14 @@ fn menu_items(i: usize) -> &'static [&'static str] {
             "Validate",
             "Find substructure matches",
             "Name structure",
+            "Auto-map reaction (Complete)",
+            "Auto-map reaction (Matching)",
+            "Auto-map reaction (Changing)",
             "Clean 2D",
             "Aromatize",
             "Kekulé form",
             "Stereochemistry report",
+            "Assign R/S labels with RDKit",
             "Generate 3D coordinates",
             "3D viewer",
             "Add explicit hydrogens",
@@ -5483,9 +8389,14 @@ fn menu_items(i: usize) -> &'static [&'static str] {
         7 => &[
             "Formula & mass",
             "Molecular properties",
+            "Local topological descriptors",
+            "Chemistry A acid/base tools",
             "Reaction analysis",
             "Auto-balance reaction",
+            "Auto-balance all reaction steps",
             "View all reaction steps",
+            "View previous reaction step",
+            "View next reaction step",
             "View reaction step 1",
             "View reaction step 2",
             "View reaction step 3",
@@ -5495,14 +8406,20 @@ fn menu_items(i: usize) -> &'static [&'static str] {
             "Reaction component: automatic role",
             "Reaction coefficient: 2",
             "Reaction coefficient: 3",
+            "Reaction coefficient: custom",
             "Reaction step: 1",
             "Reaction step: 2",
             "Reaction step: 3",
             "RDKit descriptors",
+            "Gasteiger partial charges",
             "Enumerate tautomers",
             "Enumerate stereoisomers",
         ],
-        8 => &["Search PubChem in browser", "Integration status"],
+        8 => &[
+            "Fetch PubChem properties",
+            "Search PubChem in browser",
+            "Integration status",
+        ],
         9 => &[
             "Quick start guide",
             "Naming lesson",
@@ -5541,6 +8458,20 @@ fn wrap_info_lines(text: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+fn background_calculation_error(message: &str) -> (String, String) {
+    if let Some(detail) = message.strip_prefix("PUBCHEM_LOOKUP\n") {
+        (
+            format!("PubChem lookup failed. The drawing was not changed.\n\n{detail}"),
+            "PubChem lookup failed".into(),
+        )
+    } else {
+        (
+            format!("RDKit unavailable: {message}\nInstall RDKit in a Python environment and set MOLECULA_PYTHON to its interpreter."),
+            "Calculation failed".into(),
+        )
+    }
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     if let Ok(font) = load_ttf_font_from_bytes(include_bytes!("../assets/DejaVuSans.ttf")) {
@@ -5556,6 +8487,7 @@ async fn main() {
         UI_LANGUAGE.with(|language| language.set(e.language));
         UI_DARK_MODE.with(|mode| mode.set(e.dark_theme));
         UI_INPUT_ENABLED.with(|enabled| enabled.set(!e.settings_open));
+        e.persist_zoom_preference();
         if is_quit_requested() {
             prevent_quit();
             if e.documents.iter().any(|doc| doc.dirty) {
@@ -5587,29 +8519,77 @@ async fn main() {
                 .map(|result| (captured == &e.mol, result))
         }) {
             e.calc_rx = None;
+            let auto_mapping = e.auto_map_pending.take();
+            let auto_mapping_result = auto_mapping.is_some();
             if current {
+                let calculation_failed = result.is_err();
+                let cip_assignment = result
+                    .as_ref()
+                    .is_ok_and(|report| report.starts_with("ASSIGN_STEREO\n"));
+                let clipboard_copy = result
+                    .as_ref()
+                    .is_ok_and(|report| report.starts_with("COPIED_SMILES\n"));
                 match result {
+                    Ok(report) if auto_mapping.is_some() => {
+                        let (source, target, mode) = auto_mapping.as_ref().unwrap();
+                        e.apply_auto_atom_mapping(&report, source, target, mode);
+                    }
+                    Ok(report) if report.starts_with("COPIED_SMILES\n") => {
+                        let smiles = report.trim_start_matches("COPIED_SMILES\n");
+                        e.info_overlay = Some(format!("SMILES copied to the system clipboard\nStructure notation does not include 2D layout, drawing objects or molecule metadata.\n\n{smiles}"));
+                        e.info_scroll = 0;
+                        e.status = "Copied isomeric SMILES to clipboard".into();
+                    }
+                    Ok(report) if report.starts_with("ASSIGN_STEREO\n") => {
+                        e.apply_stereo_labels(report.trim_start_matches("ASSIGN_STEREO\n"));
+                    }
                     Ok(report) if report.starts_with("IMPORT\t") => {
                         if let Some((path, payload)) = report.split_once('\n') {
                             if let Some((_, block)) = payload.split_once("MOLBLOCK\n") {
                                 match parse_mol(block) {
                                     Ok(mol) => {
                                         let filename = path.trim_start_matches("IMPORT\t");
-                                        e.open_snapshot_tab(Snapshot { mol, graphics: vec![] }, Some(filename.into()));
+                                        e.open_snapshot_tab(
+                                            Snapshot {
+                                                mol,
+                                                graphics: vec![],
+                                            },
+                                            Some(filename.into()),
+                                        );
                                         e.record_recent(filename);
-                                        e.status = format!("Imported {filename} with optional RDKit");
+                                        e.status =
+                                            format!("Imported {filename} with optional RDKit");
                                     }
-                                    Err(error) => e.info_overlay = Some(format!("RDKit produced an invalid MOL structure: {error}")),
+                                    Err(error) => {
+                                        e.info_overlay = Some(format!(
+                                            "RDKit produced an invalid MOL structure: {error}"
+                                        ))
+                                    }
                                 }
                             }
                         }
-                    },
-                    Ok(report) if report.contains("MOLBLOCK\n")=>if let Some((metadata,block))=report.split_once("MOLBLOCK\n"){e.apply_rdkit_molblock(metadata,block)},
-                    Ok(report)=>{e.info_overlay=Some(report);e.info_scroll=0;},
-                    Err(message)=>e.info_overlay=Some(format!("RDKit unavailable: {message}\nInstall RDKit in a Python environment and set MOLECULA_PYTHON to its interpreter.")),
+                    }
+                    Ok(report) if report.contains("MOLBLOCK\n") => {
+                        if let Some((metadata, block)) = report.split_once("MOLBLOCK\n") {
+                            e.apply_rdkit_molblock(metadata, block)
+                        }
+                    }
+                    Ok(report) => {
+                        e.info_overlay = Some(report);
+                        e.info_scroll = 0;
+                    }
+                    Err(message) => {
+                        let (notice, status) = background_calculation_error(&message);
+                        e.info_overlay = Some(notice);
+                        e.status = status;
+                    }
                 }
-                e.status = "Calculation finished".into();
+                if !calculation_failed && !cip_assignment && !clipboard_copy && !auto_mapping_result
+                {
+                    e.status = "Calculation finished".into();
+                }
             } else {
+                e.auto_map_pending = None;
                 e.status = "Discarded calculation for an earlier molecule".into();
             }
         }
@@ -5626,25 +8606,79 @@ async fn main() {
             let w = screen_width();
             let h = screen_height();
             draw_rectangle(0., 0., w, 58., navy());
-            draw_text("MOLECULA  ·  3D VIEW", 24., 37., 22., WHITE);
+            let (view_title, rotate_hint, no_coordinates, partial_coordinates) =
+                if e.language == Language::Danish {
+                    (
+                        "MOLECULA  ·  3D-VISNING",
+                        "Træk/hjul · R nulstil · A symboler",
+                        "Ingen 3D-koordinater. Vælg Beregninger → Generér 3D-koordinater.",
+                        "Nogle atomer mangler 3D-koordinater.",
+                    )
+                } else {
+                    (
+                        "MOLECULA  ·  3D VIEW",
+                        "Drag/wheel · R reset · A symbols",
+                        "No 3D coordinates. Choose Calculations → Generate 3D coordinates.",
+                        "Some atoms have no 3D coordinates.",
+                    )
+                };
+            draw_text(view_title, 24., 37., 22., WHITE);
             draw_text(
-                "Drag to rotate · wheel to zoom",
+                rotate_hint,
                 275.,
                 36.,
                 15.,
                 Color::from_rgba(185, 204, 194, 255),
             );
             if button(
-                w - 240.,
+                w - 500.,
                 12.,
-                105.,
+                140.,
                 34.,
-                ["Wireframe", "Sticks", "Ball & stick"][e.view_3d_style as usize],
+                three_d_style_name(e.view_3d_style, e.language),
                 false,
             ) {
-                e.view_3d_style = (e.view_3d_style + 1) % 3;
+                e.view_3d_style = (e.view_3d_style + 1) % THREE_D_STYLE_COUNT;
             }
-            if button(w - 125., 12., 105., 34., "Close  ×", true) || is_key_pressed(KeyCode::Escape)
+            let symbols_label = if e.language == Language::Danish {
+                if e.show_3d_atom_symbols {
+                    "Symboler: Til"
+                } else {
+                    "Symboler: Fra"
+                }
+            } else if e.show_3d_atom_symbols {
+                "Symbols: On"
+            } else {
+                "Symbols: Off"
+            };
+            if button(w - 352., 12., 118., 34., symbols_label, false) {
+                e.toggle_3d_atom_symbols();
+            }
+            let reset_label = if e.language == Language::Danish {
+                "Nulstil"
+            } else {
+                "Reset view"
+            };
+            if button(w - 226., 12., 96., 34., reset_label, false) || is_key_pressed(KeyCode::R) {
+                e.rotation_3d = Vec2::ZERO;
+                e.zoom_3d = 1.;
+                e.last_3d_pointer = None;
+                e.status = if e.language == Language::Danish {
+                    "3D-visning nulstillet".into()
+                } else {
+                    "3D view reset".into()
+                };
+            }
+            if is_key_pressed(KeyCode::A) {
+                e.toggle_3d_atom_symbols();
+            }
+            let close_label = if e.language == Language::Danish {
+                "Luk  ×"
+            } else {
+                "Close  ×"
+            };
+            if button(w - 125., 12., 105., 34., close_label, true)
+                || is_key_pressed(KeyCode::Escape)
             {
                 e.view_3d_open = false;
                 e.last_3d_pointer = None;
@@ -5672,50 +8706,76 @@ async fn main() {
                 if wheel != 0. {
                     e.zoom_3d = (e.zoom_3d * 1.12_f32.powf(wheel)).clamp(0.2, 5.);
                 }
-                let projected: Vec<Vec2> = e
+                let projected: Vec<Option<(Vec2, f32)>> = e
                     .mol
                     .atoms
                     .iter()
                     .map(|a| {
-                        a.coord3d
-                            .map(|q| project_3d(q, center, e.rotation_3d, scale, origin))
-                            .unwrap_or(origin)
+                        a.coord3d.map(|q| {
+                            let rotated = rotate_3d(q - center, e.rotation_3d);
+                            (
+                                project_3d(q, center, e.rotation_3d, scale, origin),
+                                rotated.z,
+                            )
+                        })
                     })
                     .collect();
-                if e.view_3d_style != 2 {
+                if e.view_3d_style != 3 {
                     for bond in &e.mol.bonds {
-                        if bond.a < projected.len() && bond.b < projected.len() {
-                            let color = if e.view_3d_style == 0 {
-                                Color::from_rgba(120, 145, 132, 180)
-                            } else {
-                                Color::from_rgba(75, 84, 78, 255)
-                            };
+                        if let (Some((a, _)), Some((b, _))) = (
+                            projected.get(bond.a).copied().flatten(),
+                            projected.get(bond.b).copied().flatten(),
+                        ) {
                             draw_line(
-                                projected[bond.a].x,
-                                projected[bond.a].y,
-                                projected[bond.b].x,
-                                projected[bond.b].y,
+                                a.x,
+                                a.y,
+                                b.x,
+                                b.y,
                                 if e.view_3d_style == 0 { 1. } else { 3. },
-                                color,
+                                three_d_bond_color(e.view_3d_style),
                             );
                         }
                     }
                 }
-                for (atom, at) in e.mol.atoms.iter().zip(projected) {
-                    let radius = if e.view_3d_style == 2 {
-                        13.
-                    } else if atom.element == "C" {
-                        3.5
-                    } else {
-                        7.
-                    };
-                    draw_circle(at.x, at.y, radius, element_color(&atom.element));
-                    if e.view_3d_style == 2 || atom.element != "C" {
+                let mut draw_order: Vec<(usize, Vec2, f32)> = projected
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, position)| {
+                        position.map(|(point, depth)| (index, point, depth))
+                    })
+                    .collect();
+                draw_order.sort_by(|left, right| left.2.total_cmp(&right.2));
+                for (index, at, _) in draw_order {
+                    let atom = &e.mol.atoms[index];
+                    let radius = three_d_atom_radius(e.view_3d_style, &atom.element, scale);
+                    draw_circle(
+                        at.x,
+                        at.y,
+                        radius,
+                        three_d_atom_color(e.view_3d_style, &atom.element),
+                    );
+                    if e.show_3d_atom_symbols {
                         draw_text(&atom.element, at.x + radius + 2., at.y + 5., 14., ink());
                     }
                 }
+                if e.mol.atoms.iter().any(|atom| atom.coord3d.is_none()) {
+                    draw_text(
+                        partial_coordinates,
+                        24.,
+                        82.,
+                        16.,
+                        Color::from_rgba(196, 112, 55, 255),
+                    );
+                }
+            } else if !e.mol.atoms.is_empty() {
+                draw_text(no_coordinates, 24., 88., 17., muted());
             }
-            draw_text("3D coordinates are stored separately; camera movement does not change the 2D structure.",24.,h-22.,14.,muted());
+            let coordinate_note = if e.language == Language::Danish {
+                "3D-koordinater gemmes separat; kamerabevægelser ændrer ikke 2D-strukturen."
+            } else {
+                "3D coordinates are stored separately; camera movement does not change the 2D structure."
+            };
+            draw_text(coordinate_note, 24., h - 22., 14., muted());
             next_frame().await;
             continue;
         }
@@ -5865,6 +8925,7 @@ async fn main() {
         }
         let world_p = e.to_world(p, w, h);
         let display = e.display_snapshot(w, h);
+        let analysis = chemistry::analyze(&e.mol);
         if (is_mouse_button_pressed(MouseButton::Middle)
             || (is_key_down(KeyCode::Space) && is_mouse_button_pressed(MouseButton::Left)))
             && canvas(p)
@@ -6253,13 +9314,11 @@ async fn main() {
             if e.selected_atoms.contains(&i) || e.naming_highlight.contains(&i) {
                 draw_circle(a.pos.x, a.pos.y, 17., Color::from_rgba(196, 223, 253, 255));
             }
-            if show_label(&e.mol, i) {
-                let label = format!(
-                    "{}{}{}",
-                    a.isotope.map(|n| n.to_string()).unwrap_or_default(),
-                    a.alias.as_ref().unwrap_or(&a.element),
-                    charge_label(a.charge)
-                );
+            let implicit_h = analysis.implicit_h.get(i).copied().flatten();
+            if show_label(&e.mol, i)
+                || (e.show_implicit_hydrogens && implicit_h.is_some_and(|h| h > 0))
+            {
+                let label = atom_display_label(a, implicit_h, e.show_implicit_hydrogens);
                 let d = measure_text(&label, None, 21, 1.);
                 draw_rectangle(
                     a.pos.x - d.width / 2. - 3.,
@@ -6286,6 +9345,15 @@ async fn main() {
             }
             if let Some(n) = a.atom_map {
                 draw_text(&format!("{n}"), a.pos.x + 10., a.pos.y + 17., 13., GRAY);
+            }
+            if let Some(label @ ("R" | "S")) = a.stereo.as_deref() {
+                draw_text(
+                    label,
+                    a.pos.x + 11.,
+                    a.pos.y - 13.,
+                    13.,
+                    Color::from_rgba(149, 92, 24, 255),
+                );
             }
         }
         if let Some(start) = e.selection_box {
@@ -6392,6 +9460,63 @@ async fn main() {
                 }
             }
         }
+        if matches!(e.tool, Tool::Template(_)) && canvas(p) {
+            if let Some(preview) = &e.template_preview {
+                let placement_center = e.template_placement_center(world_p);
+                let ghost = Color::new(accent().r, accent().g, accent().b, 0.58);
+                let screen_pos = |atom: &Atom| {
+                    let rotated =
+                        rotate_template_point(atom.pos, vec2(0., 0.), e.template_rotation);
+                    e.to_screen(placement_center + rotated, w, h)
+                };
+                for bond in &preview.bonds {
+                    if let (Some(a), Some(b)) =
+                        (preview.atoms.get(bond.a), preview.atoms.get(bond.b))
+                    {
+                        draw_chem_bond(screen_pos(a), screen_pos(b), bond, ghost);
+                    }
+                }
+                for atom in &preview.atoms {
+                    let at = screen_pos(atom);
+                    let label = atom_display_label(atom, None, false);
+                    if !label.is_empty() {
+                        let dims = measure_text(&label, None, 16, 1.0);
+                        draw_rectangle(
+                            at.x - dims.width * 0.5 - 2.,
+                            at.y - 10.,
+                            dims.width + 4.,
+                            14.,
+                            Color::new(1., 1., 1., 0.78),
+                        );
+                        draw_text(&label, at.x - dims.width * 0.5, at.y + 2., 16., ghost);
+                    } else if preview.bonds.is_empty() {
+                        draw_circle_lines(at.x, at.y, 4., 1.5, ghost);
+                    }
+                }
+                if let (Some(target), Some((anchor_index, _))) =
+                    (e.template_attachment_target, e.template_anchor())
+                {
+                    if let (Some(target_atom), Some(anchor_atom)) =
+                        (e.mol.atoms.get(target), preview.atoms.get(anchor_index))
+                    {
+                        let linker = Bond {
+                            a: 0,
+                            b: 1,
+                            order: 1,
+                            style: BondStyle::Normal,
+                            stereo: None,
+                            query: None,
+                        };
+                        draw_chem_bond(
+                            e.to_screen(target_atom.pos, w, h),
+                            screen_pos(anchor_atom),
+                            &linker,
+                            ghost,
+                        );
+                    }
+                }
+            }
+        }
         let panel_x = w - RIGHT;
         draw_rectangle(panel_x, TOP, RIGHT, h - TOP - BOTTOM, panel_surface());
         draw_line(
@@ -6403,7 +9528,7 @@ async fn main() {
             Color::from_rgba(218, 226, 238, 255),
         );
         draw_text("INSPECTOR", panel_x + 16., TOP + 23., 11., muted());
-        round_rect(panel_x + 11., TOP + 38., 228., 280., 12., card_surface());
+        round_rect(panel_x + 11., TOP + 38., 228., 545., 12., card_surface());
         draw_text("Properties", panel_x + 130., TOP + 24., 16., ink());
         if e.selected_atoms.len() > 1 {
             let mut elements = std::collections::BTreeMap::<String, usize>::new();
@@ -6462,12 +9587,20 @@ async fn main() {
                 muted(),
             );
         } else if let Some(i) = e.selected.filter(|i| *i < e.mol.atoms.len()) {
-            let atom = &e.mol.atoms[i];
+            let atom = e.mol.atoms[i].clone();
             let role = atom.reaction_role.as_deref().unwrap_or("auto").to_string();
             let step = atom.reaction_step;
             let coefficient = atom.coefficient;
             draw_text(
-                &format!("Atom {}: {}", i + 1, atom.element),
+                &format!(
+                    "Atom {}: {}{}",
+                    i + 1,
+                    atom.alias.as_deref().unwrap_or(&atom.element),
+                    atom.alias
+                        .as_ref()
+                        .map(|_| format!(" ({})", atom.element))
+                        .unwrap_or_default()
+                ),
                 panel_x + 16.,
                 TOP + 61.,
                 18.,
@@ -6516,15 +9649,6 @@ async fn main() {
                 14.,
                 DARKGRAY,
             );
-            if let Some(q) = &atom.query {
-                draw_text(
-                    &format!("Query: {q}"),
-                    panel_x + 16.,
-                    TOP + 201.,
-                    16.,
-                    DARKGRAY,
-                );
-            }
             if button(panel_x + 16., TOP + 203., 100., 33., "Charge +", false) {
                 e.checkpoint();
                 e.mol.atoms[i].charge += 1;
@@ -6594,6 +9718,86 @@ async fn main() {
                 e.mol.atoms[i].valence_override =
                     cycle_valence_override(e.mol.atoms[i].valence_override);
             }
+            let radical_label = match atom.radical {
+                1 => "singlet",
+                2 => "doublet",
+                3 => "triplet",
+                _ => "none",
+            };
+            if button(
+                panel_x + 16.,
+                TOP + 348.,
+                210.,
+                29.,
+                &format!(
+                    "{}: {}  ↻",
+                    localized(e.language, "Radical"),
+                    localized(e.language, radical_label)
+                ),
+                false,
+            ) {
+                e.cycle_atom_radical(i);
+            }
+            let implicit_h_label = atom
+                .implicit_h_override
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "auto".into());
+            if button(
+                panel_x + 16.,
+                TOP + 382.,
+                210.,
+                29.,
+                &format!(
+                    "{}: {}  ↻",
+                    localized(e.language, "Implicit H"),
+                    localized(e.language, &implicit_h_label)
+                ),
+                false,
+            ) {
+                e.cycle_implicit_h_override(i);
+            }
+            draw_text(
+                &localized(e.language, "Query predicates"),
+                panel_x + 16.,
+                TOP + 431.,
+                15.,
+                DARKGRAY,
+            );
+            if let Some(query) = &atom.query {
+                draw_text(
+                    &format!("{} {query}", localized(e.language, "Query:")),
+                    panel_x + 16.,
+                    TOP + 452.,
+                    13.,
+                    muted(),
+                );
+            }
+            let query_y = TOP + 468.;
+            for (n, (x, label, predicate)) in [
+                (panel_x + 16., "Aromatic", ".a"),
+                (panel_x + 126., "Aliphatic", ".A"),
+                (panel_x + 16., "Unsaturated", ".u"),
+                (panel_x + 126., "Any atom", "*"),
+                (panel_x + 16., "Heteroatom", "Q"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let y = TOP + 470. + (n / 2) as f32 * 34.;
+                if button(x, y, 100., 29., &localized(e.language, label), false) {
+                    e.apply_quick(shortcuts::QuickAction::Query(predicate.into()));
+                }
+            }
+            if button(
+                panel_x + 126.,
+                query_y + 68.,
+                100.,
+                29.,
+                &localized(e.language, "Clear query"),
+                false,
+            ) {
+                e.clear_atom_query(i);
+            }
         } else if let Some(i) = e.selected_bond.filter(|i| *i < e.mol.bonds.len()) {
             let bond = e.mol.bonds[i].clone();
             let a = &e.mol.atoms[bond.a];
@@ -6613,15 +9817,25 @@ async fn main() {
                 16.,
                 DARKGRAY,
             );
-            if button(panel_x + 16., TOP + 138., 100., 31., "Order −", false) {
+            if button(
+                panel_x + 16.,
+                TOP + 138.,
+                210.,
+                31.,
+                "Make double (=)",
+                bond.order == 2,
+            ) {
+                e.set_bond_order(i, 2);
+            }
+            if button(panel_x + 16., TOP + 176., 100., 31., "Order −", false) {
                 e.set_bond_order(i, bond.order.saturating_sub(1).max(1));
             }
-            if button(panel_x + 126., TOP + 138., 100., 31., "Order +", false) {
+            if button(panel_x + 126., TOP + 176., 100., 31., "Order +", false) {
                 e.set_bond_order(i, if bond.order == 4 { 1 } else { bond.order + 1 });
             }
             if button(
                 panel_x + 16.,
-                TOP + 176.,
+                TOP + 214.,
                 210.,
                 31.,
                 &format!("Style: {:?}  ↻", bond.style),
@@ -6632,7 +9846,7 @@ async fn main() {
             if bond.order == 2 {
                 if button(
                     panel_x + 16.,
-                    TOP + 214.,
+                    TOP + 252.,
                     210.,
                     31.,
                     &format!(
@@ -6647,7 +9861,7 @@ async fn main() {
                 draw_text(
                     &localized(e.language, "E/Z applies to double bonds"),
                     panel_x + 16.,
-                    TOP + 235.,
+                    TOP + 273.,
                     13.,
                     muted(),
                 );
@@ -6665,7 +9879,7 @@ async fn main() {
             };
             if button(
                 panel_x + 16.,
-                TOP + 252.,
+                TOP + 290.,
                 210.,
                 31.,
                 &format!("Query topology: {topology_label}  ↻"),
@@ -6673,7 +9887,7 @@ async fn main() {
             ) {
                 e.cycle_bond_topology(i);
             }
-            if button(panel_x + 16., TOP + 293., 210., 33., "Delete bond", false) {
+            if button(panel_x + 16., TOP + 328., 210., 33., "Delete bond", false) {
                 e.checkpoint();
                 e.mol.bonds.remove(i);
                 e.selected_bond = None;
@@ -6796,7 +10010,6 @@ async fn main() {
                 muted(),
             );
         }
-        let analysis = chemistry::analyze(&e.mol);
         round_rect(panel_x + 11., TOP + 350., 228., 245., 12., card_surface());
         draw_text("Whole document", panel_x + 25., TOP + 378., 20., ink());
         draw_text(
@@ -6921,6 +10134,18 @@ async fn main() {
                 accent(),
             );
         }
+        if let Tool::Template(name) = e.tool {
+            draw_text(
+                &format!(
+                    "{name} · {}° · R rotate · A attach · Esc cancel",
+                    e.template_rotation
+                ),
+                w - RIGHT - 405.,
+                TOP + 28.,
+                15.,
+                accent(),
+            );
+        }
         draw_text(
             "Keys: 1/2/3 bonds | Shift+R ring | E erase | Esc select | Cmd+Z undo | Cmd+S save",
             w - 660.,
@@ -6967,6 +10192,15 @@ async fn main() {
             if cmd && is_key_pressed(KeyCode::O) {
                 e.file_dialog = Some(false);
             }
+            if cmd && is_key_pressed(KeyCode::L) {
+                e.start_copy_smiles();
+            }
+            if cmd
+                && (is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift))
+                && is_key_pressed(KeyCode::K)
+            {
+                e.start_copy_smarts();
+            }
             if cmd && is_key_pressed(KeyCode::E) {
                 e.periodic_open = true;
             }
@@ -6982,6 +10216,17 @@ async fn main() {
             if !cmd && is_key_pressed(KeyCode::Q) {
                 e.rotate_selection(std::f32::consts::FRAC_PI_2);
             }
+            if !cmd && matches!(e.tool, Tool::Template(_)) && is_key_pressed(KeyCode::R) {
+                e.template_rotation = (e.template_rotation + 60) % 360;
+                e.quick.pending.clear();
+                e.status = format!(
+                    "Template rotation: {}° · click to place",
+                    e.template_rotation
+                );
+            }
+            if !cmd && matches!(e.tool, Tool::Template(_)) && is_key_pressed(KeyCode::A) {
+                e.toggle_template_attachment();
+            }
             if cmd && is_key_pressed(KeyCode::N) {
                 e.new_document();
             }
@@ -6989,6 +10234,7 @@ async fn main() {
                 e.delete_selection();
             }
             if is_key_pressed(KeyCode::Escape) {
+                e.cancel_template_placement();
                 e.tool = Tool::Select;
                 e.pending_arrow = None;
                 e.selected = None;
@@ -7006,7 +10252,7 @@ async fn main() {
             if !cmd && is_key_pressed(KeyCode::E) {
                 e.tool = Tool::Erase;
             }
-            if !cmd {
+            if !cmd && !matches!(e.tool, Tool::Template(_)) {
                 while let Some(ch) = get_char_pressed() {
                     for a in e.quick.push(ch, get_time()) {
                         e.apply_quick(a);
@@ -7064,12 +10310,12 @@ async fn main() {
                                 e.mol.atoms[i].charge = (e.mol.atoms[i].charge + n).clamp(-9, 9);
                             }
                         }
-                        Tool::Arrow
-                        | Tool::Electron(_)
-                        | Tool::StyledBond(_)
-                        | Tool::Bond(_)
-                        | Tool::Chain
-                        | Tool::Shape(_) => {}
+                        Tool::StyledBond(_) | Tool::Bond(_) => {
+                            if e.apply_bond_tool_to_hit_bond(world_p) {
+                                e.drag_start = None;
+                            }
+                        }
+                        Tool::Arrow | Tool::Electron(_) | Tool::Chain | Tool::Shape(_) => {}
                         Tool::Plus => {
                             e.checkpoint();
                             e.graphics.push(Graphic::Plus { pos: world_p });
@@ -7343,9 +10589,104 @@ async fn main() {
             {
                 e.pending_quit = false;
             }
+        } else if e.acid_base_open {
+            draw_rectangle(0., 0., w, h, Color::from_rgba(0, 0, 0, 120));
+            let width = 680.;
+            let height = 540.;
+            let x = (w - width) / 2.;
+            let y = (h - height) / 2.;
+            round_rect(
+                x + 5.,
+                y + 7.,
+                width,
+                height,
+                18.,
+                Color::from_rgba(0, 0, 0, 35),
+            );
+            round_rect(x, y, width, height, 18., card_surface());
+            round_rect(x, y, width, 58., 18., Color::from_rgba(232, 245, 236, 255));
+            draw_rectangle(x, y + 40., width, 18., Color::from_rgba(232, 245, 236, 255));
+            draw_text(
+                &localized(e.language, "Chemistry A acid-base workbench"),
+                x + 22.,
+                y + 36.,
+                24.,
+                ink(),
+            );
+            let tools = [
+                TextTarget::BufferPh,
+                TextTarget::PkaFromBuffer,
+                TextTarget::WeakAcidPh,
+                TextTarget::WeakBasePh,
+                TextTarget::StrongMixturePh,
+                TextTarget::PolyproticSpeciation,
+                TextTarget::BjerrumDiagram,
+                TextTarget::PolyproticTitrationPh,
+                TextTarget::PolyproticTitrationCurve,
+            ];
+            let labels = [
+                "Buffer pH from pKa",
+                "pKa from buffer measurements",
+                "Weak-acid pH",
+                "Weak-base pH",
+                "Strong acid/base mixture pH",
+                "Polyprotic speciation",
+                "Bjerrum diagram data",
+                "Polyprotic titration pH",
+                "Polyprotic titration curve",
+            ];
+            UI_INPUT_ENABLED.with(|enabled| enabled.set(true));
+            for (index, (target, label)) in tools.iter().zip(labels).enumerate() {
+                let column = index / 5;
+                let row = index % 5;
+                if button(
+                    x + 22. + column as f32 * 326.,
+                    y + 74. + row as f32 * 49.,
+                    310.,
+                    41.,
+                    &localized(e.language, label),
+                    false,
+                ) {
+                    e.start_acid_base_input(*target);
+                }
+            }
+            draw_text(
+                &localized(e.language, "pKa is entered from your class data or a cited table. No structure-based pKa prediction is made."),
+                x + 24.,
+                y + 355.,
+                13.,
+                muted(),
+            );
+            draw_text(
+                "Aqueous ideal-solution model · 25 °C · Kw = 1.0×10⁻¹⁴ · concentrations in mol/L",
+                x + 24.,
+                y + 381.,
+                13.,
+                muted(),
+            );
+            draw_text(
+                &localized(e.language, "Choose a calculation, then enter values in the order shown. Use ; between fields and | between successive pKa values."),
+                x + 24.,
+                y + 407.,
+                12.,
+                muted(),
+            );
+            draw_text(
+                &localized(e.language, "Henderson–Hasselbalch: pH = pKa + log₁₀([A⁻]/[HA]). Charts can copy data as CSV."),
+                x + 24.,
+                y + 429.,
+                12.,
+                muted(),
+            );
+            if button(x + width - 122., y + height - 55., 98., 36., "Close", true)
+                || is_key_pressed(KeyCode::Escape)
+            {
+                e.acid_base_open = false;
+            }
+            UI_INPUT_ENABLED.with(|enabled| enabled.set(false));
         } else if e.settings_open {
             let width = 440.;
-            let height = 340.;
+            let height = 400.;
             let x = (w - width) / 2.;
             let y = (h - height) / 2.;
             round_rect(
@@ -7359,8 +10700,20 @@ async fn main() {
             round_rect(x, y, width, height, 18., WHITE);
             round_rect(x, y, width, 58., 18., Color::from_rgba(238, 247, 241, 255));
             draw_rectangle(x, y + 40., width, 18., Color::from_rgba(238, 247, 241, 255));
-            draw_text("Settings", x + 22., y + 36., 25., ink());
-            draw_text("Interface language", x + 24., y + 94., 17., DARKGRAY);
+            draw_text(
+                &localized(e.language, "Settings"),
+                x + 22.,
+                y + 36.,
+                25.,
+                ink(),
+            );
+            draw_text(
+                &localized(e.language, "Interface language"),
+                x + 24.,
+                y + 94.,
+                17.,
+                DARKGRAY,
+            );
             let english_selected = e.language == Language::English;
             let danish_selected = e.language == Language::Danish;
             UI_INPUT_ENABLED.with(|enabled| enabled.set(true));
@@ -7370,7 +10723,13 @@ async fn main() {
             if button(x + 231., y + 113., 185., 48., "Dansk", danish_selected) {
                 e.set_language(Language::Danish);
             }
-            draw_text("Appearance", x + 24., y + 196., 17., ink());
+            draw_text(
+                &localized(e.language, "Appearance"),
+                x + 24.,
+                y + 196.,
+                17.,
+                ink(),
+            );
             if button(
                 x + 24.,
                 y + 214.,
@@ -7386,9 +10745,36 @@ async fn main() {
                 e.set_dark_theme(!e.dark_theme);
             }
             draw_text(
-                "Language and appearance are saved automatically.",
+                &localized(e.language, "Implicit hydrogen labels"),
                 x + 24.,
-                y + 282.,
+                y + 285.,
+                17.,
+                ink(),
+            );
+            if button(
+                x + 24.,
+                y + 303.,
+                392.,
+                42.,
+                &localized(
+                    e.language,
+                    if e.show_implicit_hydrogens {
+                        "Shown"
+                    } else {
+                        "Hidden"
+                    },
+                ),
+                e.show_implicit_hydrogens,
+            ) {
+                e.set_implicit_hydrogen_visibility(!e.show_implicit_hydrogens);
+            }
+            draw_text(
+                &localized(
+                    e.language,
+                    "Language and appearance are saved automatically.",
+                ),
+                x + 24.,
+                y + 366.,
                 14.,
                 muted(),
             );
@@ -7433,21 +10819,138 @@ async fn main() {
             }
         } else if let Some(info) = e.info_overlay.clone() {
             draw_rectangle(0., 0., w, h, Color::from_rgba(0, 0, 0, 100));
-            let mw = w.min(650.);
+            let chart = e.acid_base_chart.clone();
+            let mw = w.min(if chart.is_some() { 980. } else { 650. });
             let dx = (w - mw) / 2.;
-            let lines = wrap_info_lines(&info, 75);
-            let visible = ((h - 166.).max(24.) / 24.).floor() as usize;
+            let lines = wrap_info_lines(&info, if chart.is_some() { 116 } else { 75 });
+            let chart_top = 88.;
+            let chart_bottom = if chart.is_some() { 405. } else { 0. };
+            let visible =
+                ((h - if chart.is_some() { 575. } else { 166. }).max(24.) / 24.).floor() as usize;
             let max_scroll = lines.len().saturating_sub(visible);
             e.info_scroll = e.info_scroll.min(max_scroll);
             let end = (e.info_scroll + visible).min(lines.len());
-            let mh = (106. + end.saturating_sub(e.info_scroll) as f32 * 24.)
-                .max(300.)
+            let mh = ((if chart.is_some() { 455. } else { 106. })
+                + end.saturating_sub(e.info_scroll) as f32 * 24.)
+                .max(if chart.is_some() { 550. } else { 300. })
                 .min(h - 60.);
             let dy = (h - mh) / 2.;
             round_rect(dx, dy, mw, mh, 16., WHITE);
-            draw_text("Analysis & information", dx + 20., dy + 35., 24., ink());
+            draw_text(
+                chart
+                    .as_ref()
+                    .map_or("Analysis & information", |chart| chart.title.as_str()),
+                dx + 20.,
+                dy + 35.,
+                24.,
+                ink(),
+            );
+            if let Some(chart) = chart.as_ref() {
+                let plot_x = dx + 74.;
+                let plot_y = dy + chart_top;
+                let plot_w = mw - 112.;
+                let plot_h = chart_bottom - chart_top - 22.;
+                let x_min = chart.points.first().map_or(0.0, |point| point.0);
+                let mut x_max = chart.points.last().map_or(1.0, |point| point.0);
+                if x_max <= x_min {
+                    x_max = x_min + 1.0;
+                }
+                let (y_min, mut y_max) =
+                    if chart.y_label == "Fraction (%)" || chart.y_label == "Andel (%)" {
+                        (0.0, 100.0)
+                    } else {
+                        let values = chart.points.iter().flat_map(|point| point.1.iter());
+                        let lo = values.clone().copied().fold(f64::INFINITY, f64::min);
+                        let hi = values.copied().fold(f64::NEG_INFINITY, f64::max);
+                        ((lo.floor() - 1.0).max(0.0), (hi.ceil() + 1.0).min(14.0))
+                    };
+                if y_max <= y_min {
+                    y_max = y_min + 1.0;
+                }
+                let grid = Color::from_rgba(223, 232, 226, 255);
+                let palette = [
+                    Color::from_rgba(26, 132, 87, 255),
+                    Color::from_rgba(54, 120, 190, 255),
+                    Color::from_rgba(203, 111, 40, 255),
+                    Color::from_rgba(143, 83, 174, 255),
+                    Color::from_rgba(195, 65, 77, 255),
+                    Color::from_rgba(44, 150, 157, 255),
+                    Color::from_rgba(132, 143, 50, 255),
+                    Color::from_rgba(95, 100, 110, 255),
+                    Color::from_rgba(194, 126, 152, 255),
+                ];
+                for tick in 0..=5 {
+                    let fraction = tick as f32 / 5.0;
+                    let y = plot_y + plot_h * (1.0 - fraction);
+                    draw_line(plot_x, y, plot_x + plot_w, y, 1.0, grid);
+                    let label = y_min + (y_max - y_min) * f64::from(fraction);
+                    draw_text(&format!("{label:.0}"), dx + 31., y + 4., 13., muted());
+                    let x = plot_x + plot_w * fraction;
+                    draw_line(x, plot_y, x, plot_y + plot_h, 1.0, grid);
+                    let x_label = x_min + (x_max - x_min) * f64::from(fraction);
+                    draw_text(
+                        &format!("{x_label:.1}"),
+                        x - 13.,
+                        plot_y + plot_h + 18.,
+                        12.,
+                        muted(),
+                    );
+                }
+                draw_line(plot_x, plot_y, plot_x, plot_y + plot_h, 1.5, ink());
+                draw_line(
+                    plot_x,
+                    plot_y + plot_h,
+                    plot_x + plot_w,
+                    plot_y + plot_h,
+                    1.5,
+                    ink(),
+                );
+                for (series_index, label) in chart.series.iter().enumerate() {
+                    let color = palette[series_index % palette.len()];
+                    let mut previous = None;
+                    for (x_value, values) in &chart.points {
+                        let Some(y_value) = values.get(series_index).copied() else {
+                            continue;
+                        };
+                        let x = plot_x + ((*x_value - x_min) / (x_max - x_min)) as f32 * plot_w;
+                        let y =
+                            plot_y + (1.0 - ((y_value - y_min) / (y_max - y_min)) as f32) * plot_h;
+                        if let Some((px, py)) = previous {
+                            draw_line(px, py, x, y, 2.4, color);
+                        }
+                        previous = Some((x, y));
+                    }
+                    let legend_x = plot_x + (series_index % 5) as f32 * (plot_w / 5.0);
+                    let legend_y = dy + chart_bottom - 1. + (series_index / 5) as f32 * 18.;
+                    draw_line(
+                        legend_x,
+                        legend_y - 3.,
+                        legend_x + 20.,
+                        legend_y - 3.,
+                        3.,
+                        color,
+                    );
+                    draw_text(label, legend_x + 25., legend_y + 1., 13., ink());
+                }
+                draw_text(&chart.y_label, dx + 19., plot_y + plot_h / 2., 13., muted());
+                draw_text(
+                    &chart.x_label,
+                    plot_x + plot_w / 2. - 70.,
+                    dy + chart_bottom + 34.,
+                    13.,
+                    muted(),
+                );
+                draw_text(
+                    "IDEAL AQUEOUS MODEL · 25 °C",
+                    dx + mw - 260.,
+                    dy + 35.,
+                    11.,
+                    muted(),
+                );
+            }
             for (j, line) in lines[e.info_scroll..end].iter().enumerate() {
-                draw_text(line, dx + 20., dy + 68. + j as f32 * 24., 16., DARKGRAY);
+                let text_y = dy + if chart.is_some() { 435. } else { 68. } + j as f32 * 24.;
+                draw_text(line, dx + 20., text_y, 15., DARKGRAY);
             }
             if lines.len() > visible {
                 draw_text(
@@ -7458,20 +10961,118 @@ async fn main() {
                     muted(),
                 );
             }
-            if button(dx + mw - 120., dy + mh - 50., 100., 34., "Close", true)
-                || is_key_pressed(KeyCode::Escape)
+            if let Some(chart) = chart.as_ref() {
+                if button(
+                    dx + 20.,
+                    dy + mh - 50.,
+                    124.,
+                    34.,
+                    &localized(e.language, "Copy CSV data"),
+                    false,
+                ) {
+                    let csv = chemistry_chart_csv(chart);
+                    match copy_text_to_clipboard(&csv) {
+                        Ok(()) => e.status = "Copied plotted Chemistry A data as CSV".into(),
+                        Err(error) => e.status = error,
+                    }
+                }
+            }
+            if button(
+                dx + mw - 120.,
+                dy + mh - 50.,
+                100.,
+                34.,
+                &localized(e.language, "Close"),
+                true,
+            ) || is_key_pressed(KeyCode::Escape)
             {
                 e.info_overlay = None;
+                e.acid_base_chart = None;
                 e.naming_highlight.clear();
             }
         } else if e.text_target.is_some() {
             draw_rectangle(0., 0., w, h, Color::from_rgba(0, 0, 0, 100));
-            let dx = (w - 500.) / 2.;
-            let dy = (h - 175.) / 2.;
-            draw_rectangle(dx, dy, 500., 175., WHITE);
-            draw_text("Enter text", dx + 20., dy + 35., 24., DARKGRAY);
-            draw_rectangle_lines(dx + 20., dy + 55., 460., 39., 1., accent());
+            let text_target = e.text_target.unwrap();
+            let acid_base_prompt_text = acid_base_prompt(text_target);
+            let acid_base_input = acid_base_prompt_text.is_some();
+            let width = if acid_base_input { 650. } else { 500. };
+            let height = if acid_base_input { 250. } else { 195. };
+            let dx = (w - width) / 2.;
+            let template_name = matches!(e.text_target, Some(TextTarget::TemplateName));
+            let template_rename = matches!(e.text_target, Some(TextTarget::RenameUserTemplate(_)));
+            let molecule_property = matches!(e.text_target, Some(TextTarget::MoleculeProperty));
+            let reaction_coefficient =
+                matches!(e.text_target, Some(TextTarget::ReactionCoefficient));
+            let template_edit = template_name || template_rename;
+            let dy = (h - height) / 2.;
+            round_rect(dx, dy, width, height, 14., card_surface());
+            let dialog_title = if acid_base_input {
+                localized(e.language, "Chemistry A acid-base workbench").into_owned()
+            } else if molecule_property {
+                localized(e.language, "Edit molecule data").into_owned()
+            } else if reaction_coefficient {
+                localized(e.language, "Reaction coefficient: custom").into_owned()
+            } else if template_name {
+                "Name custom template".into()
+            } else if template_rename {
+                "Rename custom template".into()
+            } else {
+                "Enter text".into()
+            };
+            draw_text(&dialog_title, dx + 20., dy + 35., 24., DARKGRAY);
+            draw_rectangle_lines(dx + 20., dy + 55., width - 40., 39., 1., accent());
             draw_text(&e.text_buffer, dx + 27., dy + 81., 20., DARKGRAY);
+            if acid_base_input {
+                let prompt = localized(e.language, acid_base_prompt_text.unwrap());
+                draw_text(&prompt, dx + 21., dy + 116., 14., muted());
+                draw_text(
+                    &localized(
+                        e.language,
+                        "Enter values separated by semicolons. Decimal comma or point is accepted.",
+                    ),
+                    dx + 21.,
+                    dy + 139.,
+                    13.,
+                    muted(),
+                );
+                draw_text(
+                    &localized(e.language, acid_base_example(text_target).unwrap_or("")),
+                    dx + 21.,
+                    dy + 165.,
+                    13.,
+                    accent(),
+                );
+            } else if template_edit {
+                draw_text(
+                    "1–48 letters, numbers, spaces, hyphens or underscores",
+                    dx + 21.,
+                    dy + 111.,
+                    13.,
+                    muted(),
+                );
+            } else if molecule_property {
+                draw_text(
+                    &localized(
+                        e.language,
+                        "KEY=VALUE saves or updates · -KEY removes · NAME sets molecule name",
+                    ),
+                    dx + 21.,
+                    dy + 111.,
+                    12.,
+                    muted(),
+                );
+            } else if reaction_coefficient {
+                draw_text(
+                    &localized(
+                        e.language,
+                        "Set a whole-number coefficient from 1 to 99 for this component.",
+                    ),
+                    dx + 21.,
+                    dy + 111.,
+                    13.,
+                    muted(),
+                );
+            }
             while let Some(ch) = get_char_pressed() {
                 if !ch.is_control() {
                     e.text_buffer.push(ch);
@@ -7482,14 +11083,40 @@ async fn main() {
             }
             if is_key_pressed(KeyCode::Escape) {
                 e.text_target = None;
+                if template_edit {
+                    e.templates_open = false;
+                }
             }
             if is_key_pressed(KeyCode::Enter) {
                 e.commit_text();
             }
-            if button(dx + 260., dy + 119., 100., 35., "Cancel", false) {
+            if button(
+                dx + width - 220.,
+                dy + height - 52.,
+                100.,
+                35.,
+                "Cancel",
+                false,
+            ) {
                 e.text_target = None;
+                if template_edit {
+                    e.templates_open = false;
+                }
             }
-            if button(dx + 372., dy + 119., 108., 35., "Apply", true) {
+            if button(
+                dx + width - 108.,
+                dy + height - 52.,
+                108.,
+                35.,
+                if template_rename {
+                    "Rename"
+                } else if template_name || molecule_property {
+                    "Save"
+                } else {
+                    "Apply"
+                },
+                true,
+            ) {
                 e.commit_text();
             }
         } else if e.periodic_open {
@@ -7532,89 +11159,265 @@ async fn main() {
                 17.,
                 ink(),
             );
+            if button(
+                dx + 18.,
+                dy + 90.,
+                216.,
+                30.,
+                "Built-in",
+                !e.template_tab_custom,
+            ) {
+                e.template_tab_custom = false;
+                e.pending_delete_template = None;
+                e.template_page = 0;
+            }
+            if button(
+                dx + 246.,
+                dy + 90.,
+                236.,
+                30.,
+                "My templates",
+                e.template_tab_custom,
+            ) {
+                e.template_tab_custom = true;
+                e.pending_delete_template = None;
+                e.template_page = 0;
+            }
             while let Some(ch) = get_char_pressed() {
                 if !ch.is_control() {
                     e.template_query.push(ch);
+                    e.template_page = 0;
                 }
             }
             if is_key_pressed(KeyCode::Backspace) {
                 e.template_query.pop();
+                e.template_page = 0;
             }
-            let choices: Vec<&str> = [
-                "Benzene",
-                "Cyclohexane",
-                "Pyridine",
-                "Ethanol",
-                "Carboxyl",
-                "Cyclopropane",
-                "Cyclobutane",
-                "Cyclopentane",
-                "Cycloheptane",
-                "Cyclooctane",
-                "Pyrimidine",
-                "Imidazole",
-                "Pyrrole",
-                "Furan",
-                "Thiophene",
-                "Hydroxyl",
-                "Amino",
-                "Carbonyl",
-                "Aldehyde",
-                "Nitrile",
-                "Ester",
-                "Amide",
-                "Glycine",
-                "Alanine",
-            ]
-            .into_iter()
-            .filter(|name| {
-                name.to_lowercase()
-                    .contains(&e.template_query.to_lowercase())
-            })
-            .take(12)
-            .collect();
-            let ring_names = [
-                "Benzene",
-                "Cyclohexane",
-                "Pyridine",
-                "Cyclopropane",
-                "Cyclobutane",
-                "Cyclopentane",
-                "Cycloheptane",
-                "Cyclooctane",
-                "Pyrimidine",
-                "Imidazole",
-                "Pyrrole",
-                "Furan",
-                "Thiophene",
-            ];
-            draw_text("Rings", dx + 20., dy + 108., 12., muted());
-            draw_text("Groups · amino acids", dx + 265., dy + 108., 12., muted());
-            let mut category_rows = [0usize; 2];
-            for kind in &choices {
-                let col = if ring_names.contains(kind) { 0 } else { 1 };
-                let row = category_rows[col];
-                category_rows[col] += 1;
-                if button(
-                    dx + 18. + col as f32 * 232.,
-                    dy + 116. + row as f32 * 51.,
-                    224.,
-                    42.,
-                    kind,
-                    false,
-                ) {
-                    e.tool = Tool::Template(kind);
-                    e.templates_open = false;
-                    e.status = format!("Click canvas to place {kind}");
-                    e.template_query.clear();
+            if !e.template_tab_custom {
+                let all_choices: Vec<&str> = [
+                    "Benzene",
+                    "Cyclohexane",
+                    "Naphthalene",
+                    "Decalin",
+                    "Indole",
+                    "Quinoline",
+                    "Anthracene",
+                    "Phenanthrene",
+                    "Norbornane",
+                    "Pyridine",
+                    "Ethanol",
+                    "Carboxyl",
+                    "Cyclopropane",
+                    "Cyclobutane",
+                    "Cyclopentane",
+                    "Cycloheptane",
+                    "Cyclooctane",
+                    "Pyrimidine",
+                    "Imidazole",
+                    "Pyrrole",
+                    "Furan",
+                    "Thiophene",
+                    "Hydroxyl",
+                    "Amino",
+                    "Carbonyl",
+                    "Aldehyde",
+                    "Nitrile",
+                    "Ester",
+                    "Amide",
+                    "Glycine",
+                    "Alanine",
+                    "Valine",
+                    "Leucine",
+                    "Isoleucine",
+                    "Serine",
+                    "Threonine",
+                    "Cysteine",
+                    "Methionine",
+                    "Aspartic acid",
+                    "Asparagine",
+                    "Glutamic acid",
+                    "Glutamine",
+                    "Lysine",
+                    "Arginine",
+                    "Histidine",
+                    "Phenylalanine",
+                    "Tyrosine",
+                    "Tryptophan",
+                    "Proline",
+                ]
+                .into_iter()
+                .filter(|name| builtin_template_matches_query(name, &e.template_query))
+                .collect();
+                let page_count = all_choices.len().div_ceil(6).max(1);
+                e.template_page = e.template_page.min(page_count - 1);
+                let choices: Vec<&str> = all_choices
+                    .iter()
+                    .skip(e.template_page * 6)
+                    .take(6)
+                    .copied()
+                    .collect();
+                let ring_names = [
+                    "Benzene",
+                    "Cyclohexane",
+                    "Naphthalene",
+                    "Decalin",
+                    "Indole",
+                    "Quinoline",
+                    "Anthracene",
+                    "Phenanthrene",
+                    "Norbornane",
+                    "Pyridine",
+                    "Cyclopropane",
+                    "Cyclobutane",
+                    "Cyclopentane",
+                    "Cycloheptane",
+                    "Cyclooctane",
+                    "Pyrimidine",
+                    "Imidazole",
+                    "Pyrrole",
+                    "Furan",
+                    "Thiophene",
+                ];
+                draw_text("Rings", dx + 20., dy + 135., 12., muted());
+                draw_text("Groups · amino acids", dx + 265., dy + 135., 12., muted());
+                let mut category_rows = [0usize; 2];
+                for kind in &choices {
+                    let col = if ring_names.contains(kind) { 0 } else { 1 };
+                    let row = category_rows[col];
+                    category_rows[col] += 1;
+                    if button(
+                        dx + 18. + col as f32 * 232.,
+                        dy + 142. + row as f32 * 44.,
+                        224.,
+                        36.,
+                        kind,
+                        false,
+                    ) {
+                        e.activate_builtin_template(kind);
+                        e.template_query.clear();
+                    }
+                }
+                if all_choices.is_empty() {
+                    draw_text("No matching templates", dx + 20., dy + 165., 15., muted());
+                }
+                if page_count > 1 {
+                    if button(dx + 18., dy + 421., 96., 30., "← Previous", false)
+                        && e.template_page > 0
+                    {
+                        e.template_page -= 1;
+                    }
+                    draw_text(
+                        &format!("{} / {page_count}", e.template_page + 1),
+                        dx + 218.,
+                        dy + 442.,
+                        14.,
+                        muted(),
+                    );
+                    if button(dx + 386., dy + 421., 96., 30., "Next →", false)
+                        && e.template_page + 1 < page_count
+                    {
+                        e.template_page += 1;
+                    }
+                }
+            } else {
+                let matching: Vec<(usize, String)> = e
+                    .user_templates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, template)| {
+                        template
+                            .name
+                            .to_lowercase()
+                            .contains(&e.template_query.to_lowercase())
+                    })
+                    .map(|(index, template)| (index, template.name.clone()))
+                    .collect();
+                let page_count = matching.len().div_ceil(6).max(1);
+                e.template_page = e.template_page.min(page_count - 1);
+                for (row, (index, name)) in matching
+                    .iter()
+                    .skip(e.template_page * 6)
+                    .take(6)
+                    .enumerate()
+                {
+                    let y = dy + 132. + row as f32 * 44.;
+                    if button(
+                        dx + 18.,
+                        y,
+                        194.,
+                        36.,
+                        &name.chars().take(28).collect::<String>(),
+                        false,
+                    ) {
+                        e.activate_custom_template(e.user_templates[*index].mol.clone());
+                        e.template_query.clear();
+                    }
+                    if button(dx + 218., y, 60., 36., "Insert", false) {
+                        e.activate_custom_template(e.user_templates[*index].mol.clone());
+                        e.template_query.clear();
+                    }
+                    if button(dx + 284., y, 76., 36., "Rename", false) {
+                        e.text_buffer = name.clone();
+                        e.text_target = Some(TextTarget::RenameUserTemplate(*index));
+                    }
+                    let deleting = e.pending_delete_template == Some(*index);
+                    if button(
+                        dx + 366.,
+                        y,
+                        116.,
+                        36.,
+                        if deleting { "Confirm delete" } else { "Delete" },
+                        deleting,
+                    ) {
+                        if deleting {
+                            match e.delete_user_template(*index) {
+                                Ok(()) => e.pending_delete_template = None,
+                                Err(error) => e.status = error,
+                            }
+                        } else {
+                            e.pending_delete_template = Some(*index);
+                        }
+                    }
+                }
+                if matching.is_empty() {
+                    draw_text("No custom templates yet", dx + 20., dy + 160., 15., muted());
+                }
+                draw_text(
+                    &format!("Page {} / {page_count}", e.template_page + 1),
+                    dx + 300.,
+                    dy + 438.,
+                    13.,
+                    muted(),
+                );
+                if e.template_page > 0 && button(dx + 270., dy + 416., 72., 31., "Previous", false)
+                {
+                    e.template_page -= 1;
+                }
+                if e.template_page + 1 < page_count
+                    && button(dx + 350., dy + 416., 72., 31., "Next", false)
+                {
+                    e.template_page += 1;
                 }
             }
-            if choices.is_empty() {
-                draw_text("No matching templates", dx + 20., dy + 136., 15., muted());
+            if button(
+                dx + 18.,
+                dy + 416.,
+                235.,
+                31.,
+                "Save selected fragment",
+                false,
+            ) {
+                if e.selected.is_none() && e.selected_atoms.is_empty() {
+                    e.status = "Select a connected fragment before saving a template".into();
+                } else {
+                    e.text_buffer.clear();
+                    e.text_target = Some(TextTarget::TemplateName);
+                }
             }
             if is_key_pressed(KeyCode::Escape) {
                 e.templates_open = false;
                 e.template_query.clear();
+                e.pending_delete_template = None;
             }
         } else if e.pending_export.is_some() {
             draw_rectangle(0., 0., w, h, Color::from_rgba(0, 0, 0, 90));
@@ -7651,7 +11454,7 @@ async fn main() {
                 || is_key_pressed(KeyCode::Enter)
             {
                 if let Some(path) = e.pending_export.take() {
-                    e.save(&path);
+                    e.save_confirmed(&path);
                 }
             }
         } else {
@@ -7665,7 +11468,7 @@ async fn main() {
                 if saving {
                     "Save molecule"
                 } else {
-                    "Open MOL, SDF, RXN, SMILES or MOLS"
+                    "Open MOL, SDF, RXN, SMILES, SMARTS or MOLS"
                 },
                 dx + 22.,
                 dy + 38.,
@@ -7746,6 +11549,7 @@ async fn main() {
                 draw_text(text, LEFT + 18., ty + 23., 14., WHITE);
             }
         }
+        e.persist_zoom_preference();
         e.sync_active_document();
         next_frame().await;
     }
@@ -7755,7 +11559,7 @@ fn tool_help(t: Tool) -> &'static str {
         Tool::Select => "Select and drag atoms or graphic objects (Esc)",
         Tool::Erase => "Delete one atom, bond or object (E)",
         Tool::Bond(1) => "Draw a single bond (1)",
-        Tool::Bond(2) => "Draw a double bond (2)",
+        Tool::Bond(2) => "Draw or change a bond to a double bond (2)",
         Tool::Bond(3) => "Draw a triple bond (3)",
         Tool::StyledBond(BondStyle::Aromatic) => "Draw an aromatic bond (4)",
         Tool::StyledBond(BondStyle::Wedge) => "Draw a filled wedge (5)",
@@ -7775,7 +11579,7 @@ fn tool_help(t: Tool) -> &'static str {
         Tool::Shape(ShapeKind::Line) => "Drag to draw a line",
         Tool::Shape(ShapeKind::Rectangle) => "Drag to draw a rectangle",
         Tool::Shape(ShapeKind::Ellipse) => "Drag to draw an ellipse",
-        Tool::Template(_) => "Click canvas to place template",
+        Tool::Template(_) => "R rotates by 60°; A attaches to one selected atom; Esc cancels",
         _ => "Draw a bond",
     }
 }
@@ -7783,6 +11587,359 @@ fn tool_help(t: Tool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chemistry_a_workbench_routes_inputs_to_real_pka_and_ph_calculations() {
+        let mut editor = Editor::new();
+        editor.menu_action("Chemistry A acid/base tools");
+        assert!(editor.acid_base_open);
+
+        editor.start_acid_base_input(TextTarget::BufferPh);
+        editor.text_buffer = "4,76;0,10;0,20".into();
+        editor.commit_text();
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|report| report.contains("Buffer pH = 5.0610")));
+
+        editor.start_acid_base_input(TextTarget::PkaFromBuffer);
+        editor.text_buffer = "5,06;0,10;0,20".into();
+        editor.commit_text();
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|report| report.contains("pKa = 4.7590")));
+
+        editor.start_acid_base_input(TextTarget::BjerrumDiagram);
+        editor.text_buffer = "2,15|7,20|12,35;0;14;2".into();
+        editor.commit_text();
+        assert!(editor.info_overlay.as_deref().is_some_and(|report| {
+            report.contains("Bjerrum distribution table") && report.contains("14.00")
+        }));
+        let chart = editor.acid_base_chart.as_ref().unwrap();
+        assert_eq!(chart.series.len(), 4);
+        assert_eq!(chart.points.len(), 8);
+        assert!(chart
+            .points
+            .iter()
+            .all(|(_, fractions)| { (fractions.iter().sum::<f64>() - 100.0).abs() < 1e-9 }));
+
+        editor.start_acid_base_input(TextTarget::PolyproticTitrationPh);
+        editor.text_buffer = "4,76;25;0,10;0,10;12,5".into();
+        editor.commit_text();
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|report| report.contains("Titration pH =")));
+    }
+
+    #[test]
+    fn chemistry_a_workbench_localizes_calculation_results_and_keeps_plottable_data() {
+        let mut editor = Editor::new();
+        editor.language = Language::Danish;
+        editor.calculate_acid_base(TextTarget::BufferPh, "4.76;0.1;0.2");
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|report| report.contains("Buffer-pH = 5.0610")));
+
+        editor.calculate_acid_base(TextTarget::PolyproticTitrationCurve, "4.76;25;0.1;0.1;1.5");
+        let curve = editor.acid_base_chart.as_ref().unwrap();
+        assert_eq!(curve.points.len(), 41);
+        assert_eq!(curve.series, ["pH"]);
+        assert!(curve
+            .points
+            .windows(2)
+            .all(|points| { points[0].0 < points[1].0 && points[0].1[0] <= points[1].1[0] }));
+        let csv = chemistry_chart_csv(curve);
+        assert!(csv.starts_with("Tilsat stærk base (mL),pH\n"));
+        assert_eq!(csv.lines().count(), 42);
+
+        editor.calculate_acid_base(TextTarget::WeakAcidPh, "4.76;0.1");
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|report| report.contains("Metode: ideel vandig monoprotisk ligevægt")));
+    }
+
+    #[test]
+    fn chemistry_a_calculator_refuses_missing_and_nonphysical_inputs_without_fake_values() {
+        let mut editor = Editor::new();
+        editor.calculate_acid_base(TextTarget::WeakAcidPh, "4.76;0");
+        assert!(editor.info_overlay.as_deref().is_some_and(|report| {
+            report.contains("calculation unavailable") && report.contains("positive number")
+        }));
+        editor.calculate_acid_base(TextTarget::PkaFromBuffer, "7;0.1;0");
+        assert!(editor.info_overlay.as_deref().is_some_and(|report| {
+            report.contains("calculation unavailable") && report.contains("positive number")
+        }));
+    }
+
+    #[test]
+    fn three_d_atom_symbol_visibility_persists_without_clobbering_other_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "molecula-3d-settings-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "language=da\ntheme=dark\n").unwrap();
+        assert!(load_3d_atom_symbols_visibility_from(&path));
+        save_3d_atom_symbols_visibility_to(&path, false).unwrap();
+        assert!(!load_3d_atom_symbols_visibility_from(&path));
+        let settings = fs::read_to_string(&path).unwrap();
+        assert!(settings.contains("language=da"));
+        assert!(settings.contains("theme=dark"));
+        save_3d_atom_symbols_visibility_to(&path, true).unwrap();
+        assert!(load_3d_atom_symbols_visibility_from(&path));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn three_d_render_modes_provide_cpk_spacefill_and_monochrome_behavior() {
+        assert_eq!(THREE_D_STYLE_COUNT, 5);
+        assert_eq!(three_d_style_name(3, Language::English), "Spacefill");
+        assert_eq!(three_d_style_name(3, Language::Danish), "Rumfyldning");
+        assert_eq!(three_d_atom_color(2, "O"), element_color("O"));
+        assert_ne!(element_color("O"), element_color("N"));
+        assert_eq!(three_d_atom_color(4, "O"), three_d_atom_color(4, "C"));
+        assert!(three_d_atom_radius(3, "Br", 70.) > three_d_atom_radius(3, "H", 70.));
+        assert_eq!(three_d_atom_radius(0, "C", 70.), 2.5);
+    }
+
+    #[test]
+    fn three_d_camera_rotation_preserves_coordinate_distance() {
+        let point = vec3(1.25, -3.5, 4.75);
+        let rotated = rotate_3d(point, vec2(0.83, -0.41));
+        assert!((rotated.length() - point.length()).abs() < 0.0001);
+        assert_eq!(
+            project_3d(point, point, vec2(1.0, 1.0), 80., vec2(5., 9.)),
+            vec2(5., 9.)
+        );
+    }
+
+    #[test]
+    fn background_calculation_errors_keep_pubchem_and_rdkit_distinct() {
+        let (pubchem_notice, pubchem_status) =
+            background_calculation_error("PUBCHEM_LOOKUP\ncurl: could not resolve host");
+        assert!(pubchem_notice.contains("PubChem lookup failed"));
+        assert!(pubchem_notice.contains("The drawing was not changed"));
+        assert!(pubchem_notice.contains("could not resolve host"));
+        assert_eq!(pubchem_status, "PubChem lookup failed");
+
+        let (rdkit_notice, rdkit_status) = background_calculation_error("No module named rdkit");
+        assert!(rdkit_notice.contains("RDKit unavailable"));
+        assert!(rdkit_notice.contains("MOLECULA_PYTHON"));
+        assert_eq!(rdkit_status, "Calculation failed");
+    }
+
+    #[test]
+    fn molecule_data_dialog_updates_removes_and_undoes_sdf_fields() {
+        let mut editor = Editor::new();
+        editor.menu_action("Edit molecule data");
+        assert!(matches!(
+            editor.text_target,
+            Some(TextTarget::MoleculeProperty)
+        ));
+        editor.text_buffer = "sample_id=RX-17".into();
+        editor.commit_text();
+        assert_eq!(
+            editor.mol.properties,
+            vec![("sample_id".into(), "RX-17".into())]
+        );
+        editor.text_buffer = "NAME=Ethyl acetate".into();
+        editor.text_target = Some(TextTarget::MoleculeProperty);
+        editor.commit_text();
+        assert_eq!(editor.mol.name, "Ethyl acetate");
+        assert!(editor
+            .mol
+            .properties
+            .iter()
+            .any(|(key, value)| key == "NAME" && value == "Ethyl acetate"));
+
+        let mut sdf = molfile_for(&editor.mol);
+        for (key, value) in &editor.mol.properties {
+            sdf += &format!(">  <{key}>\n{value}\n\n");
+        }
+        sdf += "$$$$\n";
+        let loaded = parse_sdf(&sdf).unwrap().remove(0);
+        assert_eq!(loaded.properties, editor.mol.properties);
+        let snapshot = Snapshot {
+            mol: editor.mol.clone(),
+            graphics: vec![],
+        };
+        assert_eq!(
+            native::read(&native::write(&snapshot)).unwrap().mol,
+            snapshot.mol
+        );
+
+        editor.text_buffer = "-sample_id".into();
+        editor.text_target = Some(TextTarget::MoleculeProperty);
+        editor.commit_text();
+        assert!(!editor
+            .mol
+            .properties
+            .iter()
+            .any(|(key, _)| key == "sample_id"));
+        editor.undo();
+        assert!(editor
+            .mol
+            .properties
+            .iter()
+            .any(|(key, value)| key == "sample_id" && value == "RX-17"));
+
+        let before = editor.mol.properties.clone();
+        editor.text_buffer = "bad key=value".into();
+        editor.text_target = Some(TextTarget::MoleculeProperty);
+        editor.commit_text();
+        assert_eq!(editor.mol.properties, before);
+    }
+
+    #[test]
+    fn rdkit_cip_labels_apply_to_atoms_and_undo_without_touching_drawn_stereo() {
+        let mut editor = Editor::new();
+        for _ in 0..3 {
+            editor.add_atom(vec2(0., 0.), "C");
+        }
+        editor.mol.atoms[0].stereo = Some("R".into());
+        editor.mol.atoms[1].stereo = Some("@@".into());
+        editor.mol.atoms[2].stereo = Some("S".into());
+        editor.apply_stereo_labels(
+            "ENGINE\tRDKit 2026\nMETHOD\tRDKit stereochemistry assignment\nATOM\t2\tS\n",
+        );
+        assert_eq!(editor.mol.atoms[0].stereo, None);
+        assert_eq!(editor.mol.atoms[1].stereo.as_deref(), Some("S"));
+        assert_eq!(editor.mol.atoms[2].stereo, None);
+        editor.undo();
+        assert_eq!(editor.mol.atoms[0].stereo.as_deref(), Some("R"));
+        assert_eq!(editor.mol.atoms[1].stereo.as_deref(), Some("@@"));
+        assert_eq!(editor.mol.atoms[2].stereo.as_deref(), Some("S"));
+
+        let before = editor.mol.clone();
+        editor.apply_stereo_labels("ATOM\t0\tR\n");
+        assert_eq!(editor.mol, before);
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|text| text.contains("invalid")));
+        editor.apply_stereo_labels("ATOM\t1\tR\nATOM\t1\tS\n");
+        assert_eq!(editor.mol, before);
+    }
+
+    #[test]
+    fn unique_atom_map_assignment_respects_selection_and_is_undoable() {
+        let mut editor = Editor::new();
+        for _ in 0..4 {
+            editor.add_atom(vec2(0., 0.), "C");
+        }
+        editor.mol.atoms[0].atom_map = Some(3);
+        editor.selected_atoms = vec![2, 1];
+        editor.assign_unique_atom_maps();
+        assert_eq!(editor.mol.atoms[0].atom_map, Some(3));
+        assert_eq!(editor.mol.atoms[1].atom_map, Some(1));
+        assert_eq!(editor.mol.atoms[2].atom_map, Some(2));
+        assert_eq!(editor.mol.atoms[3].atom_map, None);
+        editor.undo();
+        assert_eq!(editor.mol.atoms[1].atom_map, None);
+        assert_eq!(editor.mol.atoms[2].atom_map, None);
+
+        editor.clear_selection();
+        editor.assign_unique_atom_maps();
+        assert_eq!(
+            editor
+                .mol
+                .atoms
+                .iter()
+                .filter_map(|atom| atom.atom_map)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn copy_smiles_command_refuses_unrepresentable_query_data_and_has_platform_clipboard() {
+        assert!(all_commands().contains(&"Copy as SMILES"));
+        assert!(all_commands().contains(&"Copy as SMARTS"));
+        assert!(all_commands().contains(&"Copy drawing as image"));
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.mol.atoms[0].alias = Some("Me".into());
+        editor.menu_action("Copy as SMILES");
+        assert!(editor.calc_rx.is_none());
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|text| text.contains("cannot be represented safely")));
+        #[cfg(target_os = "macos")]
+        assert_eq!(clipboard_candidates()[0].0, "pbcopy");
+        #[cfg(target_os = "windows")]
+        assert_eq!(clipboard_candidates()[0].0, "clip.exe");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert!(clipboard_candidates()
+            .iter()
+            .any(|(program, _)| *program == "wl-copy"));
+    }
+
+    #[test]
+    fn copy_smarts_refuses_unrepresentable_aliases_before_touching_clipboard() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.mol.atoms[0].alias = Some("Ph".into());
+        editor.menu_action("Copy as SMARTS");
+        assert!(editor.calc_rx.is_none());
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|text| text.contains("cannot preserve aliases")));
+    }
+
+    #[test]
+    fn smarts_file_export_writes_query_text_and_warns_about_document_loss() {
+        let mut editor = Editor::new();
+        let carbon = editor.add_atom(vec2(0., 0.), "C");
+        let oxygen = editor.add_atom(vec2(40., 0.), "O");
+        editor.add_bond(carbon, oxygen, 1);
+        let path =
+            std::env::temp_dir().join(format!("molecula-query-{}.smarts", std::process::id()));
+        let path_text = path.to_string_lossy().to_string();
+        editor.save(&path_text);
+        assert_eq!(editor.pending_export.as_deref(), Some(path_text.as_str()));
+        editor.save_confirmed(&path_text);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "C-O\n");
+        assert!(editor.status.starts_with("Exported "));
+        assert!(editor
+            .export_losses(&path_text)
+            .contains(&"document metadata, reaction annotation and drawing objects"));
+        let mut imported = Editor::new();
+        imported.load(&path_text);
+        assert_eq!(imported.mol.atoms.len(), 2);
+        assert_eq!(imported.mol.bonds.len(), 1);
+        assert!(imported.status.starts_with("Opened SMARTS pattern"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_smiles_file_import_and_export_work_without_rdkit() {
+        let path =
+            std::env::temp_dir().join(format!("molecula-local-smiles-{}.smi", std::process::id()));
+        let mut editor = Editor::new();
+        editor.mol = smiles::parse("CC(=O)O").unwrap();
+        editor.save(path.to_str().unwrap());
+        assert!(editor.pending_export.is_some());
+        editor.save_confirmed(path.to_str().unwrap());
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.trim(), "CC(=O)O");
+        fs::write(&path, "\n# generated structure\nCC(=O)O acetic-acid\n").unwrap();
+
+        let mut restored = Editor::new();
+        restored.load(path.to_str().unwrap());
+        assert_eq!(restored.mol.atoms.len(), 4);
+        assert_eq!(restored.mol.bonds.len(), 3);
+        assert_eq!(restored.status, format!("Opened SMILES {}", path.display()));
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn valence_override_control_cycles_back_to_automatic() {
@@ -8126,6 +12283,370 @@ mod tests {
     }
 
     #[test]
+    fn fused_and_bridged_ring_templates_are_real_undoable_chemical_graphs() {
+        for (name, formula, atoms, bonds, rings) in [
+            ("Naphthalene", "C10H8", 10, 11, 2),
+            ("Decalin", "C10H18", 10, 11, 2),
+            ("Indole", "C8H7N", 9, 10, 2),
+            ("Quinoline", "C9H7N", 10, 11, 2),
+            ("Anthracene", "C14H10", 14, 16, 3),
+            ("Phenanthrene", "C14H10", 14, 16, 3),
+            ("Norbornane", "C7H12", 7, 8, 2),
+        ] {
+            assert!(builtin_template_matches_query(name, ""));
+            assert!(builtin_template_matches_query(name, "ring"));
+            let mut editor = Editor::new();
+            editor.insert_template(name, vec2(100., 100.));
+            assert_eq!(editor.mol.atoms.len(), atoms, "{name} atom count");
+            assert_eq!(editor.mol.bonds.len(), bonds, "{name} bond count");
+            let analysis = chemistry::analyze(&editor.mol);
+            assert_eq!(analysis.formula, formula, "{name}");
+            assert_eq!(analysis.connected_components, 1, "{name}");
+            assert_eq!(analysis.cycle_rank, rings, "{name}");
+            assert!(
+                analysis.warnings.is_empty(),
+                "{name}: {:?}",
+                analysis.warnings
+            );
+            if matches!(
+                name,
+                "Naphthalene" | "Indole" | "Quinoline" | "Anthracene" | "Phenanthrene"
+            ) {
+                assert!(editor.mol.atoms.iter().all(|atom| atom.aromatic));
+                assert!(editor.mol.bonds.iter().all(|bond| bond.order == 4));
+            }
+            editor.undo();
+            assert!(
+                editor.mol.atoms.is_empty(),
+                "{name} insertion is one undoable action"
+            );
+        }
+    }
+
+    #[test]
+    fn proteinogenic_amino_acid_templates_have_expected_formulas_and_graphs() {
+        for (name, formula) in [
+            ("Glycine", "C2H5NO2"),
+            ("Alanine", "C3H7NO2"),
+            ("Valine", "C5H11NO2"),
+            ("Leucine", "C6H13NO2"),
+            ("Isoleucine", "C6H13NO2"),
+            ("Serine", "C3H7NO3"),
+            ("Threonine", "C4H9NO3"),
+            ("Cysteine", "C3H7NO2S"),
+            ("Methionine", "C5H11NO2S"),
+            ("Aspartic acid", "C4H7NO4"),
+            ("Asparagine", "C4H8N2O3"),
+            ("Glutamic acid", "C5H9NO4"),
+            ("Glutamine", "C5H10N2O3"),
+            ("Lysine", "C6H14N2O2"),
+            ("Arginine", "C6H14N4O2"),
+            ("Histidine", "C6H9N3O2"),
+            ("Phenylalanine", "C9H11NO2"),
+            ("Tyrosine", "C9H11NO3"),
+            ("Tryptophan", "C11H12N2O2"),
+            ("Proline", "C5H9NO2"),
+        ] {
+            assert!(
+                builtin_template_matches_query(name, "amino acid"),
+                "{name} search alias"
+            );
+            let mut editor = Editor::new();
+            editor.insert_template(name, vec2(0., 0.));
+            let analysis = chemistry::analyze(&editor.mol);
+            assert_eq!(analysis.formula, formula, "{name}");
+            assert_eq!(analysis.connected_components, 1, "{name}");
+            assert!(!editor.mol.atoms.is_empty(), "{name}");
+            editor.undo();
+            assert!(editor.mol.atoms.is_empty(), "{name}");
+        }
+        assert!(!builtin_template_matches_query("Benzene", "proteinogenic"));
+    }
+
+    #[test]
+    fn built_in_and_custom_templates_rotate_before_placement() {
+        let center = vec2(250., 180.);
+        let mut normal = Editor::new();
+        normal.insert_template("Ethanol", center);
+        let mut rotated = Editor::new();
+        rotated.template_rotation = 60;
+        rotated.insert_template("Ethanol", center);
+        assert_eq!(rotated.template_rotation, 0);
+        assert_eq!(rotated.mol.bonds, normal.mol.bonds);
+        for (got, original) in rotated.mol.atoms.iter().zip(&normal.mol.atoms) {
+            assert!(
+                got.pos
+                    .distance(rotate_template_point(original.pos, center, 60))
+                    < 0.01
+            );
+        }
+        for bond in &rotated.mol.bonds {
+            assert!(
+                (rotated.mol.atoms[bond.a]
+                    .pos
+                    .distance(rotated.mol.atoms[bond.b].pos)
+                    - normal.mol.atoms[bond.a]
+                        .pos
+                        .distance(normal.mol.atoms[bond.b].pos))
+                .abs()
+                    < 0.01
+            );
+        }
+
+        let mut custom_graph = Molecule::default();
+        custom_graph.atoms.push(Atom::new(vec2(-20., 0.), "C"));
+        custom_graph.atoms.push(Atom::new(vec2(20., 0.), "O"));
+        custom_graph.bonds.push(Bond {
+            a: 0,
+            b: 1,
+            order: 1,
+            style: BondStyle::Normal,
+            stereo: None,
+            query: None,
+        });
+        let mut custom = Editor::new();
+        custom.template_rotation = 90;
+        custom.pending_custom_template = Some(custom_graph);
+        custom.insert_template("User", center);
+        assert!((custom.mol.atoms[0].pos.distance(custom.mol.atoms[1].pos) - 40.0).abs() < 0.01);
+        assert!((custom.mol.atoms[0].pos.x - center.x).abs() < 0.01);
+        assert!((custom.mol.atoms[1].pos.x - center.x).abs() < 0.01);
+        assert_eq!(custom.template_rotation, 0);
+    }
+
+    #[test]
+    fn template_activation_prepares_ghost_graphs_for_builtin_and_custom_templates() {
+        let mut editor = Editor::new();
+        editor.activate_builtin_template("Benzene");
+        let preview = editor.template_preview.as_ref().unwrap();
+        assert_eq!(preview.atoms.len(), 6);
+        assert_eq!(preview.bonds.len(), 6);
+        assert!(matches!(editor.tool, Tool::Template("Benzene")));
+        assert!(editor.pending_custom_template.is_none());
+
+        let mut custom = Molecule {
+            name: "Offset pair".into(),
+            ..Molecule::default()
+        };
+        custom.atoms.push(Atom::new(vec2(20., -10.), "C"));
+        custom.atoms.push(Atom::new(vec2(60., -10.), "O"));
+        custom.bonds.push(Bond {
+            a: 0,
+            b: 1,
+            order: 1,
+            style: BondStyle::Normal,
+            stereo: None,
+            query: None,
+        });
+        editor.activate_custom_template(custom);
+        let preview = editor.template_preview.as_ref().unwrap();
+        assert_eq!(preview.atoms.len(), 2);
+        assert_eq!(preview.bonds.len(), 1);
+        assert!((preview.atoms[0].pos.x + 20.).abs() < 0.001);
+        assert!((preview.atoms[1].pos.x - 20.).abs() < 0.001);
+        assert!(editor.pending_custom_template.is_some());
+        assert!(matches!(editor.tool, Tool::Template("User")));
+        editor.template_rotation = 120;
+        editor.cancel_template_placement();
+        assert_eq!(editor.template_preview, None);
+        assert_eq!(editor.pending_custom_template, None);
+        assert_eq!(editor.template_rotation, 0);
+        assert!(matches!(editor.tool, Tool::Select));
+    }
+
+    #[test]
+    fn attached_template_preview_aligns_anchor_and_insertion_is_one_undoable_graph_edit() {
+        let mut editor = Editor::new();
+        editor.mol.atoms.push(Atom::new(vec2(200., 180.), "C"));
+        editor.selected = Some(0);
+        editor.selected_atoms = vec![0];
+        editor.activate_builtin_template("Benzene");
+        editor.toggle_template_attachment();
+        assert_eq!(editor.template_attachment_target, Some(0));
+        editor.template_rotation = 60;
+        let cursor = vec2(200., 320.);
+        let center = editor.template_placement_center(cursor);
+        let (anchor_index, anchor) = editor.template_anchor().unwrap();
+        let anchor_world = center + rotate_template_point(anchor, vec2(0., 0.), 60);
+        assert!((anchor_world.distance(editor.mol.atoms[0].pos) - BOND).abs() < 0.01);
+
+        editor.insert_template("Benzene", cursor);
+        assert_eq!(editor.mol.atoms.len(), 7);
+        assert_eq!(editor.mol.bonds.len(), 7);
+        assert_eq!(molecule_components(&editor.mol).len(), 1);
+        let attachment = editor
+            .mol
+            .bonds
+            .iter()
+            .find(|bond| bond.a == 0 || bond.b == 0)
+            .unwrap();
+        let inserted_anchor = if attachment.a == 0 {
+            attachment.b
+        } else {
+            attachment.a
+        };
+        assert_eq!(inserted_anchor, anchor_index + 1);
+        assert!(
+            (editor.mol.atoms[inserted_anchor]
+                .pos
+                .distance(editor.mol.atoms[0].pos)
+                - BOND)
+                .abs()
+                < 0.01
+        );
+
+        editor.undo();
+        assert_eq!(editor.mol.atoms.len(), 1);
+        assert!(editor.mol.bonds.is_empty());
+
+        let mut custom = Editor::new();
+        custom.mol.atoms.push(Atom::new(vec2(80., 40.), "C"));
+        custom.selected = Some(0);
+        custom.selected_atoms = vec![0];
+        let mut pair = Molecule {
+            name: "C–O pair".into(),
+            ..Molecule::default()
+        };
+        pair.atoms.push(Atom::new(vec2(-20., 0.), "C"));
+        pair.atoms.push(Atom::new(vec2(20., 0.), "O"));
+        pair.bonds.push(Bond {
+            a: 0,
+            b: 1,
+            order: 1,
+            style: BondStyle::Normal,
+            stereo: None,
+            query: None,
+        });
+        custom.activate_custom_template(pair);
+        custom.toggle_template_attachment();
+        custom.template_rotation = 90;
+        custom.insert_template("User", vec2(80., 160.));
+        assert_eq!(custom.mol.atoms.len(), 3);
+        assert_eq!(custom.mol.bonds.len(), 2);
+        assert_eq!(molecule_components(&custom.mol).len(), 1);
+        custom.undo();
+        assert_eq!(custom.mol.atoms.len(), 1);
+        assert!(custom.mol.bonds.is_empty());
+    }
+
+    #[test]
+    fn custom_template_storage_roundtrips_graph_and_rejects_duplicate_names() {
+        let directory = std::env::temp_dir().join(format!(
+            "molecula-user-template-storage-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut molecule = Molecule::default();
+        let mut carbon = Atom::new(vec2(-20., 0.), "C");
+        carbon.isotope = Some(13);
+        carbon.alias = Some("Me".into());
+        molecule.atoms.push(carbon);
+        molecule.atoms.push(Atom::new(vec2(20., 0.), "O"));
+        molecule.bonds.push(Bond {
+            a: 0,
+            b: 1,
+            order: 1,
+            style: BondStyle::Normal,
+            stereo: None,
+            query: None,
+        });
+        let saved = save_user_template_to(&directory, "Methyl ether", &molecule).unwrap();
+        assert_eq!(saved.name, "Methyl ether");
+        let loaded = load_user_templates_from(&directory).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Methyl ether");
+        assert_eq!(loaded[0].mol.atoms.len(), 2);
+        assert_eq!(loaded[0].mol.bonds.len(), 1);
+        assert_eq!(loaded[0].mol.atoms[0].isotope, Some(13));
+        assert_eq!(loaded[0].mol.atoms[0].alias.as_deref(), Some("Me"));
+        assert!(save_user_template_to(&directory, "Methyl ether", &molecule).is_err());
+        let _existing = save_user_template_to(&directory, "Existing", &molecule).unwrap();
+        assert!(save_user_template_to(&directory, "../unsafe", &molecule).is_err());
+        let mut invalid = molecule.clone();
+        invalid.bonds[0].b = 99;
+        assert!(save_user_template_to(&directory, "Invalid", &invalid).is_err());
+        let mut editor = Editor::new();
+        editor.user_templates = load_user_templates_from(&directory).unwrap();
+        let original_index = editor
+            .user_templates
+            .iter()
+            .position(|template| template.name == "Methyl ether")
+            .unwrap();
+        assert!(editor
+            .rename_user_template_in(original_index, "Existing", &directory)
+            .is_err());
+        assert!(
+            saved.path.exists(),
+            "duplicate rename must preserve original"
+        );
+        assert!(editor
+            .rename_user_template_in(original_index, "Ether group", &directory)
+            .is_ok());
+        assert!(!saved.path.exists());
+        let renamed = load_user_templates_from(&directory).unwrap();
+        assert_eq!(renamed.len(), 2);
+        let ether = renamed
+            .iter()
+            .find(|template| template.name == "Ether group")
+            .unwrap();
+        assert_eq!(ether.mol.atoms[0].isotope, Some(13));
+        assert_eq!(ether.mol.atoms[0].alias.as_deref(), Some("Me"));
+        assert_eq!(ether.mol.bonds.len(), 1);
+        let renamed_index = editor
+            .user_templates
+            .iter()
+            .position(|template| template.name == "Ether group")
+            .unwrap();
+        editor.delete_user_template(renamed_index).unwrap();
+        let existing_index = editor
+            .user_templates
+            .iter()
+            .position(|template| template.name == "Existing")
+            .unwrap();
+        editor.delete_user_template(existing_index).unwrap();
+        assert!(!saved.path.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selected_custom_template_extracts_connected_graph_and_inserts_undoably() {
+        let mut editor = Editor::new();
+        let c = editor.add_atom(vec2(0., 0.), "C");
+        let o = editor.add_atom(vec2(43., 0.), "O");
+        let n = editor.add_atom(vec2(220., 0.), "N");
+        editor.add_bond(c, o, 2);
+        editor.selected_atoms = vec![c, o];
+        editor.selected = Some(c);
+        editor.mol.atoms[c].reaction_role = Some("reactant".into());
+        editor.mol.atoms[c].atom_map = Some(7);
+
+        let fragment = editor.selected_fragment_for_template().unwrap();
+        assert_eq!(fragment.atoms.len(), 2);
+        assert_eq!(fragment.bonds.len(), 1);
+        assert!(fragment
+            .atoms
+            .iter()
+            .all(|atom| atom.reaction_role.is_none()));
+        assert!(fragment.atoms.iter().all(|atom| atom.atom_map.is_none()));
+        assert!((fragment.atoms[0].pos + fragment.atoms[1].pos).length() < 0.001);
+        editor.selected_atoms = vec![c, n];
+        assert!(editor.selected_fragment_for_template().is_err());
+
+        editor.insert_custom_template(fragment, vec2(400., 300.));
+        assert_eq!(editor.mol.atoms.len(), 5);
+        assert_eq!(editor.mol.bonds.len(), 2);
+        assert!(editor
+            .mol
+            .bonds
+            .iter()
+            .any(|bond| bond.a == 3 && bond.b == 4));
+        assert_eq!(editor.mol.atoms[n].element, "N");
+        editor.undo();
+        assert_eq!(editor.mol.atoms.len(), 3);
+        assert_eq!(editor.mol.bonds.len(), 1);
+    }
+
+    #[test]
     fn pubchem_query_encoding_is_safe_and_stable() {
         assert_eq!(url_encode("salicylic acid"), "salicylic%20acid");
         assert_eq!(url_encode("C/C=C\\O"), "C%2FC%3DC%5CO");
@@ -8155,12 +12676,65 @@ mod tests {
     }
 
     #[test]
+    fn svg_png_and_pdf_exports_preserve_bond_display_styles() {
+        let styles = [
+            (BondStyle::Normal, 2, 0),
+            (BondStyle::Aromatic, 9, 0),
+            (BondStyle::Wedge, 0, 1),
+            (BondStyle::Hash, 11, 0),
+            (BondStyle::Wavy, 24, 0),
+            (BondStyle::Coordinate, 3, 0),
+            (BondStyle::Any, 8, 0),
+        ];
+        for (style, expected_lines, expected_triangles) in styles {
+            let mut editor = Editor::new();
+            editor.mol.atoms = vec![
+                Atom::new(vec2(100., 100.), "C"),
+                Atom::new(vec2(170., 100.), "C"),
+            ];
+            editor.mol.bonds.push(Bond {
+                a: 0,
+                b: 1,
+                order: if style == BondStyle::Normal { 2 } else { 1 },
+                style,
+                stereo: None,
+                query: None,
+            });
+            let svg = editor.svg_with_size(640., 360.);
+            assert_eq!(svg.matches("<line ").count(), expected_lines, "{style:?}");
+            assert_eq!(
+                svg.matches("<polygon ").count(),
+                expected_triangles,
+                "{style:?}"
+            );
+
+            let pdf = String::from_utf8(render_pdf(&editor.mol, &[], 842., 595.)).unwrap();
+            assert_eq!(
+                pdf.matches(" m ").count(),
+                expected_lines + expected_triangles,
+                "{style:?}"
+            );
+            assert_eq!(
+                pdf.matches(" h f\n").count(),
+                expected_triangles,
+                "{style:?}"
+            );
+
+            let png = render_png(&editor.mol, &[], 640, 360).unwrap();
+            let image = image::load_from_memory(&png).unwrap().to_rgba8();
+            assert!(image.pixels().any(|pixel| pixel[0] < 100), "{style:?}");
+        }
+    }
+
+    #[test]
     fn drawing_export_keeps_the_editable_document_dirty_and_untitled() {
         let path = std::env::temp_dir().join(format!("molecula-export-{}.png", std::process::id()));
         let mut e = Editor::new();
         e.mol.atoms.push(Atom::new(vec2(80., 80.), "N"));
         e.dirty = true;
         e.save(path.to_str().unwrap());
+        assert!(e.pending_export.is_some());
+        e.save_confirmed(path.to_str().unwrap());
         assert!(e.dirty);
         assert!(e.documents[0].path.is_none());
         assert!(path.exists());
@@ -8223,12 +12797,100 @@ mod tests {
         ));
         save_language_to(&path, Language::Danish).unwrap();
         save_setting(&path, "theme", "dark").unwrap();
+        save_implicit_hydrogen_visibility_to(&path, true).unwrap();
+        save_zoom_preference_to(&path, 1.75).unwrap();
         assert_eq!(load_language_from(&path), Language::Danish);
+        assert!(load_implicit_hydrogen_visibility_from(&path));
+        assert_eq!(load_zoom_preference_from(&path), 1.75);
         save_language_to(&path, Language::English).unwrap();
-        assert!(fs::read_to_string(&path).unwrap().contains("theme=dark"));
+        let settings = fs::read_to_string(&path).unwrap();
+        assert!(settings.contains("theme=dark"));
+        assert!(settings.contains("show_implicit_hydrogens=true"));
+        assert!(settings.contains("zoom=1.7500"));
         assert_eq!(localized(Language::Danish, "Calculations"), "Beregninger");
         assert_eq!(localized(Language::English, "Calculations"), "Calculations");
+        assert_eq!(
+            localized(Language::Danish, "Reaction coefficient: custom"),
+            "Reaktionskoefficient: brugerdefineret"
+        );
+        assert_eq!(
+            localized(Language::Danish, "Gasteiger partial charges"),
+            "Gasteiger-partialladninger"
+        );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn quick_start_guide_localizes_and_explains_in_place_bond_editing() {
+        let english = quick_start_guide(Language::English);
+        assert!(
+            english.contains("To change an existing bond, choose Double (=) and click its middle.")
+        );
+        assert!(english.contains("UNDO Cmd/Ctrl+Z"));
+
+        let danish = quick_start_guide(Language::Danish);
+        assert!(danish.contains("MOLECULA · HURTIG VEJLEDNING"));
+        assert!(danish.contains("vælg Dobbeltbinding (=), og klik midt på bindingen"));
+        assert!(danish.contains("Når et atom er valgt, skriv @ efterfulgt af et massetal"));
+        assert!(!danish.contains("With an atom selected"));
+        assert!(danish.contains("FORTRYD Cmd/Ctrl+Z"));
+    }
+
+    #[test]
+    fn zoom_preference_clamps_values_and_rejects_non_finite_writes() {
+        let path =
+            std::env::temp_dir().join(format!("molecula-zoom-test-{}.conf", std::process::id()));
+        save_zoom_preference_to(&path, 9.0).unwrap();
+        assert_eq!(load_zoom_preference_from(&path), 4.0);
+        assert!(save_zoom_preference_to(&path, f32::NAN).is_err());
+        fs::write(&path, "zoom=not-a-number\n").unwrap();
+        assert_eq!(load_zoom_preference_from(&path), 1.0);
+        fs::write(&path, "zoom=0.01\n").unwrap();
+        assert_eq!(load_zoom_preference_from(&path), 0.2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn zoom_changes_become_the_default_for_new_documents() {
+        let mut editor = Editor::new();
+        editor.zoom = 1.0;
+        editor.preferred_zoom = 1.0;
+        editor.adjust_zoom(1.5, vec2(640., 360.), 1280., 720.);
+        assert_eq!(editor.preferred_zoom, 1.5);
+        assert!(editor.zoom_preference_dirty);
+
+        editor.new_document();
+        assert_eq!(editor.zoom, 1.5);
+    }
+
+    #[test]
+    fn changed_zoom_is_written_once_without_clobbering_other_preferences() {
+        let path =
+            std::env::temp_dir().join(format!("molecula-zoom-persist-{}.conf", std::process::id()));
+        save_setting(&path, "theme", "dark").unwrap();
+        let mut editor = Editor::new();
+        editor.preferred_zoom = 2.25;
+        editor.zoom_preference_dirty = true;
+
+        editor.persist_zoom_preference_to(&path);
+
+        assert!(!editor.zoom_preference_dirty);
+        assert_eq!(load_zoom_preference_from(&path), 2.25);
+        assert!(fs::read_to_string(&path).unwrap().contains("theme=dark"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn implicit_hydrogen_labels_are_optional_and_respect_atom_aliases() {
+        let carbon = Atom::new(vec2(0., 0.), "C");
+        assert_eq!(atom_display_label(&carbon, Some(3), false), "C");
+        assert_eq!(atom_display_label(&carbon, Some(3), true), "CH3");
+        let mut oxygen = Atom::new(vec2(0., 0.), "O");
+        oxygen.charge = -1;
+        assert_eq!(atom_display_label(&oxygen, Some(0), true), "O-");
+        let mut alias = Atom::new(vec2(0., 0.), "C");
+        alias.alias = Some("Me".into());
+        assert_eq!(atom_display_label(&alias, Some(3), true), "Me");
     }
 
     #[test]
@@ -8358,6 +13020,7 @@ mod tests {
         assert_eq!(editor.mol.bonds[0].stereo.as_deref(), Some("Z"));
         editor.set_bond_order(0, 4);
         assert_eq!(editor.mol.bonds[0].style, BondStyle::Aromatic);
+        assert_eq!(editor.mol.bonds[0].stereo, None);
         assert!(editor.mol.atoms.iter().all(|atom| atom.aromatic));
         editor.cycle_bond_style(0);
         assert_eq!(editor.mol.bonds[0].order, 1);
@@ -8370,6 +13033,115 @@ mod tests {
         editor.redo();
         assert_eq!(editor.mol.bonds[0].style, BondStyle::Wedge);
         assert_eq!(editor.selected_bond, None);
+    }
+
+    #[test]
+    fn clicking_existing_bond_with_double_tool_changes_order_in_one_undoable_edit() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.add_atom(vec2(40., 0.), "C");
+        editor.add_bond(0, 1, 1);
+        editor.tool = Tool::Bond(2);
+
+        assert!(editor.apply_bond_tool_to_hit_bond(vec2(20., 0.)));
+        assert_eq!(editor.mol.bonds.len(), 1);
+        assert_eq!(editor.mol.bonds[0].order, 2);
+        assert_eq!(editor.selected_bond, Some(0));
+
+        editor.undo();
+        assert_eq!(editor.mol.bonds[0].order, 1);
+        editor.redo();
+        assert_eq!(editor.mol.bonds[0].order, 2);
+        assert_eq!(editor.mol.bonds.len(), 1);
+    }
+
+    #[test]
+    fn setting_a_concrete_bond_order_clears_only_order_alternatives_and_is_undoable() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.add_atom(vec2(40., 0.), "C");
+        editor.mol.bonds.push(Bond {
+            a: 0,
+            b: 1,
+            order: 1,
+            style: BondStyle::Any,
+            stereo: Some("E".into()),
+            query: Some("single-or-double;topology-ring".into()),
+        });
+        editor.tool = Tool::Bond(2);
+
+        assert!(editor.apply_bond_tool_to_hit_bond(vec2(20., 0.)));
+        let bond = &editor.mol.bonds[0];
+        assert_eq!(bond.order, 2);
+        assert_eq!(bond.style, BondStyle::Normal);
+        assert_eq!(bond.stereo, None);
+        assert_eq!(bond.query.as_deref(), Some("topology-ring"));
+
+        editor.undo();
+        assert_eq!(editor.mol.bonds[0].order, 1);
+        assert_eq!(editor.mol.bonds[0].style, BondStyle::Any);
+        assert_eq!(
+            editor.mol.bonds[0].query.as_deref(),
+            Some("single-or-double;topology-ring")
+        );
+        editor.redo();
+        assert_eq!(editor.mol.bonds[0].order, 2);
+        assert_eq!(editor.mol.bonds[0].query.as_deref(), Some("topology-ring"));
+    }
+
+    #[test]
+    fn query_bond_tool_updates_an_existing_bond_instead_of_adding_a_parallel_edge() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.add_atom(vec2(40., 0.), "C");
+        editor.add_bond(0, 1, 1);
+        editor.tool = Tool::StyledBond(BondStyle::Any);
+        editor.bond_query = Some("double-or-aromatic".into());
+
+        assert!(editor.apply_bond_tool_to_hit_bond(vec2(20., 0.)));
+        assert_eq!(editor.mol.bonds.len(), 1);
+        assert_eq!(editor.mol.bonds[0].style, BondStyle::Any);
+        assert_eq!(
+            editor.mol.bonds[0].query.as_deref(),
+            Some("double-or-aromatic")
+        );
+        editor.undo();
+        assert_eq!(editor.mol.bonds[0].style, BondStyle::Normal);
+        assert_eq!(editor.mol.bonds[0].query, None);
+    }
+
+    #[test]
+    fn bond_tool_click_on_atom_keeps_draw_from_atom_behavior() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.add_atom(vec2(40., 0.), "C");
+        editor.add_bond(0, 1, 1);
+        editor.tool = Tool::Bond(2);
+
+        assert!(!editor.apply_bond_tool_to_hit_bond(vec2(0., 0.)));
+        assert_eq!(editor.mol.bonds[0].order, 1);
+        assert_eq!(editor.selected_bond, None);
+    }
+
+    #[test]
+    fn changing_double_bond_to_wedge_clears_ez_and_is_undoable() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.add_atom(vec2(40., 0.), "C");
+        editor.add_bond(0, 1, 2);
+        editor.mol.bonds[0].stereo = Some("E".into());
+
+        editor.cycle_bond_style(0);
+        assert_eq!(editor.mol.bonds[0].order, 1);
+        assert_eq!(editor.mol.bonds[0].style, BondStyle::Wedge);
+        assert_eq!(editor.mol.bonds[0].stereo, None);
+
+        editor.undo();
+        assert_eq!(editor.mol.bonds[0].order, 2);
+        assert_eq!(editor.mol.bonds[0].stereo.as_deref(), Some("E"));
+        editor.redo();
+        assert_eq!(editor.mol.bonds[0].style, BondStyle::Wedge);
+        assert_eq!(editor.mol.bonds[0].stereo, None);
     }
 
     #[test]
@@ -8418,6 +13190,100 @@ mod tests {
         assert!(editor.status.contains("Conflicting query predicates"));
         editor.undo();
         assert_eq!(editor.mol.atoms[0].query.as_deref(), Some(".a"));
+    }
+
+    #[test]
+    fn atom_query_inspector_actions_add_and_clear_predicates_with_undo() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        editor.selected = Some(0);
+        editor.apply_quick(shortcuts::QuickAction::Query(".a".into()));
+        editor.apply_quick(shortcuts::QuickAction::Query(".H1".into()));
+        assert_eq!(editor.mol.atoms[0].query.as_deref(), Some(".a;.H1"));
+        editor.clear_atom_query(0);
+        assert_eq!(editor.mol.atoms[0].query, None);
+        editor.undo();
+        assert_eq!(editor.mol.atoms[0].query.as_deref(), Some(".a;.H1"));
+    }
+
+    #[test]
+    fn atom_inspector_cycles_supported_radical_states_with_undo_redo() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+
+        for expected in [1, 2, 3, 0] {
+            editor.cycle_atom_radical(0);
+            assert_eq!(editor.mol.atoms[0].radical, expected);
+        }
+        editor.undo();
+        assert_eq!(editor.mol.atoms[0].radical, 3);
+        editor.redo();
+        assert_eq!(editor.mol.atoms[0].radical, 0);
+    }
+
+    #[test]
+    fn atom_inspector_cycles_implicit_h_override_and_undoes_it() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "C");
+        for expected in [Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), None] {
+            editor.cycle_implicit_h_override(0);
+            assert_eq!(editor.mol.atoms[0].implicit_h_override, expected);
+        }
+        editor.undo();
+        assert_eq!(editor.mol.atoms[0].implicit_h_override, Some(5));
+        editor.redo();
+        assert_eq!(editor.mol.atoms[0].implicit_h_override, None);
+
+        let mut v3000 = Editor::new();
+        v3000.add_atom(vec2(0., 0.), "C");
+        v3000.mol.atoms[0].implicit_h_override = Some(5);
+        let decoded = parse_mol_at(&v3000.molfile(), vec2(0., 0.)).unwrap();
+        assert_eq!(decoded.atoms[0].implicit_h_override, Some(5));
+    }
+
+    #[test]
+    fn isotope_quick_input_edits_selected_atom_and_is_undoable() {
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(0., 0.), "N");
+        editor.selected = Some(0);
+        editor.apply_quick(shortcuts::QuickAction::Isotope(Some(15)));
+        assert_eq!(editor.mol.atoms[0].isotope, Some(15));
+        editor.undo();
+        assert_eq!(editor.mol.atoms[0].isotope, None);
+        editor.redo();
+        assert_eq!(editor.mol.atoms[0].isotope, Some(15));
+
+        let exported = editor.molfile();
+        let imported = parse_mol_at(&exported, vec2(0., 0.)).unwrap();
+        assert_eq!(imported.atoms[0].element, "N");
+        assert_eq!(imported.atoms[0].isotope, Some(15));
+
+        editor.selected = Some(0);
+        editor.apply_quick(shortcuts::QuickAction::Isotope(None));
+        assert_eq!(editor.mol.atoms[0].isotope, None);
+        editor.undo();
+        assert_eq!(editor.mol.atoms[0].isotope, Some(15));
+    }
+
+    #[test]
+    fn alias_quick_input_displays_on_carbon_and_is_undoable() {
+        let mut editor = Editor::new();
+        let carbon = editor.add_atom(vec2(0., 0.), "C");
+        let oxygen = editor.add_atom(vec2(40., 0.), "O");
+        editor.add_bond(carbon, oxygen, 1);
+        editor.selected = Some(carbon);
+        editor.apply_quick(shortcuts::QuickAction::Alias(Some("Ph".into())));
+        assert_eq!(editor.mol.atoms[carbon].alias.as_deref(), Some("Ph"));
+        assert!(show_label(&editor.mol, carbon));
+        editor.undo();
+        assert_eq!(editor.mol.atoms[carbon].alias, None);
+        assert!(!show_label(&editor.mol, carbon));
+        editor.redo();
+        assert_eq!(editor.mol.atoms[carbon].alias.as_deref(), Some("Ph"));
+
+        editor.selected = Some(carbon);
+        editor.apply_quick(shortcuts::QuickAction::Alias(None));
+        assert_eq!(editor.mol.atoms[carbon].alias, None);
     }
 
     #[test]
@@ -8554,6 +13420,50 @@ mod tests {
         assert!(!editor
             .export_losses("test.mols")
             .contains(&"advanced atom properties"));
+    }
+
+    #[test]
+    fn lossy_save_requires_confirmation_before_writing() {
+        let path =
+            std::env::temp_dir().join(format!("molecula-loss-check-{}.mol", std::process::id()));
+        let mut editor = Editor::new();
+        editor.add_atom(vec2(20., 20.), "C");
+        editor.graphics.push(Graphic::Plus {
+            pos: vec2(80., 20.),
+        });
+        let path_text = path.to_string_lossy().to_string();
+        editor.save(&path_text);
+        assert!(
+            !path.exists(),
+            "lossy file must not be written before confirmation"
+        );
+        assert_eq!(editor.pending_export.as_deref(), Some(path_text.as_str()));
+        assert!(editor.status.contains("graphics, reaction arrows and text"));
+
+        editor.save_confirmed(&path_text);
+        assert!(path.exists());
+        assert!(editor.status.starts_with("Saved "));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn smiles_export_warns_about_document_data_that_the_notation_cannot_store() {
+        let mut editor = Editor::new();
+        editor.mol = smiles::parse("CCO").unwrap();
+        let losses = editor.export_losses("ethanol.smi");
+        assert!(losses.contains(&"2D/3D coordinates and drawing layout"));
+
+        editor.mol.name = "Ethanol drawing".into();
+        editor
+            .mol
+            .properties
+            .push(("source".into(), "class handout".into()));
+        let losses = editor.export_losses("ethanol.smiles");
+        assert!(losses.contains(&"molecule name and data fields"));
+
+        editor.mol.atoms[0].alias = Some("ethyl-end".into());
+        let losses = editor.export_losses("ethanol.smi");
+        assert!(losses.contains(&"query, alias, R-group, radical, valence or stereo annotations"));
     }
 
     #[test]
@@ -8722,14 +13632,237 @@ mod tests {
         let calculation_commands = menu_items(7);
         assert!(calculation_commands.contains(&"Formula & mass"));
         assert!(calculation_commands.contains(&"Molecular properties"));
+        assert!(calculation_commands.contains(&"Local topological descriptors"));
         assert!(calculation_commands.contains(&"Reaction analysis"));
+        assert!(calculation_commands.contains(&"Reaction coefficient: custom"));
+        assert!(calculation_commands.contains(&"Gasteiger partial charges"));
+        assert!(calculation_commands.contains(&"View next reaction step"));
+        assert!(calculation_commands.contains(&"View previous reaction step"));
         assert!(calculation_commands.contains(&"RDKit descriptors"));
         assert!(calculation_commands.contains(&"Enumerate tautomers"));
         assert!(calculation_commands.contains(&"Enumerate stereoisomers"));
         assert!(menu_items(6).contains(&"Find substructure matches"));
+        assert!(menu_items(6).contains(&"Auto-map reaction (Complete)"));
+        assert!(menu_items(6).contains(&"Auto-map reaction (Matching)"));
+        assert!(menu_items(6).contains(&"Auto-map reaction (Changing)"));
         let mut editor = Editor::new();
         editor.menu_action("Recent files");
         assert!(editor.recent_open);
+    }
+
+    #[test]
+    fn automatic_atom_mapping_modes_apply_atomically_and_undo() {
+        let mut e = Editor::new();
+        for (i, element) in ["C", "O", "C", "O", "N"].into_iter().enumerate() {
+            e.mol
+                .atoms
+                .push(Atom::new(vec2(i as f32 * 30., 0.), element));
+        }
+        e.mol.bonds.push(Bond {
+            a: 0,
+            b: 1,
+            order: 1,
+            style: BondStyle::Normal,
+            stereo: None,
+            query: None,
+        });
+        e.mol.bonds.push(Bond {
+            a: 2,
+            b: 3,
+            order: 2,
+            style: BondStyle::Normal,
+            stereo: None,
+            query: None,
+        });
+        e.mol.atoms[0].atom_map = Some(7);
+        let before = e.mol.clone();
+        let report = "STATUS\tcomplete\nOPTIMALITY\toptimal_given_seed\nENGINE\tAtomMapper test\nPAIR\t0\t0\t0\nPAIR\t1\t1\t1\n";
+        e.apply_auto_atom_mapping(report, &[0, 1], &[2, 3], "Matching");
+        assert_eq!(e.mol.atoms[0].atom_map, Some(1));
+        assert_eq!(e.mol.atoms[2].atom_map, Some(1));
+        assert_eq!(e.mol.atoms[1].atom_map, Some(2));
+        assert_eq!(e.mol.atoms[3].atom_map, Some(2));
+        assert_eq!(e.mol.atoms[4].atom_map, None);
+        e.undo();
+        assert_eq!(e.mol, before);
+
+        e.apply_auto_atom_mapping(report, &[0, 1], &[2, 3], "Changing");
+        assert_eq!(e.mol.atoms[0].atom_map, None);
+        assert_eq!(e.mol.atoms[2].atom_map, None);
+        assert_eq!(e.mol.atoms[1].atom_map, Some(1));
+        assert_eq!(e.mol.atoms[3].atom_map, Some(1));
+        e.undo();
+        assert_eq!(e.mol, before);
+    }
+
+    #[test]
+    fn incomplete_or_out_of_range_auto_mapping_never_changes_graph() {
+        let mut e = Editor::new();
+        for i in 0..2 {
+            e.mol.atoms.push(Atom::new(vec2(i as f32 * 30., 0.), "C"));
+        }
+        e.mol.atoms[0].atom_map = Some(12);
+        let before = e.mol.clone();
+        e.apply_auto_atom_mapping("STATUS\ttimed_out\n", &[0], &[1], "Complete");
+        assert_eq!(e.mol, before);
+        e.apply_auto_atom_mapping("STATUS\tcomplete\nPAIR\t9\t0\t0\n", &[0], &[1], "Complete");
+        assert_eq!(e.mol, before);
+        e.apply_auto_atom_mapping(
+            "STATUS\tcomplete\nPAIR\t0\t0\t0\nPAIR\tbad\t1\t0\n",
+            &[0],
+            &[1],
+            "Complete",
+        );
+        assert_eq!(e.mol, before);
+        e.apply_auto_atom_mapping("STATUS\tcomplete\nPAIR\t0\t0\t2\n", &[0], &[1], "Complete");
+        assert_eq!(e.mol, before);
+        e.apply_auto_atom_mapping("STATUS\tcomplete\nPAIR\t0\t0\t0\n", &[0], &[1], "Changing");
+        assert_eq!(e.mol, before);
+        assert!(e.undo.is_empty());
+        e.apply_auto_atom_mapping(
+            "STATUS\tcomplete\nPAIR\t0\t0\t1\nPAIR\t0\t0\t1\n",
+            &[0],
+            &[1],
+            "Changing",
+        );
+        assert_eq!(e.mol, before);
+        assert!(e.undo.is_empty());
+    }
+
+    #[test]
+    fn overlapping_background_chemistry_jobs_do_not_replace_mapping_results() {
+        let mut e = Editor::new();
+        let (tx, rx) = mpsc::channel();
+        e.calc_rx = Some((e.mol.clone(), rx));
+        e.menu_action("Auto-map reaction (Complete)");
+        assert!(e.calc_rx.is_some());
+        assert!(e.auto_map_pending.is_none());
+        assert!(e.status.contains("Wait for the current background"));
+        let _ = tx.send(Ok("original worker result".into()));
+    }
+
+    #[test]
+    fn selected_multicomponent_reaction_runs_optional_mapper_and_maps_undoably() {
+        let python = std::env::var("MOLECULA_PYTHON").unwrap_or_else(|_| "python3".into());
+        let available = Command::new(python)
+            .args(["-c", "import rdkit, atommapper"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            return;
+        }
+
+        let mut e = Editor::new();
+        for (i, element) in ["C", "C", "O", "C", "C", "O"].into_iter().enumerate() {
+            let mut atom = Atom::new(vec2(i as f32 * 28., 0.), element);
+            atom.reaction_role = Some(if i < 3 { "reactant" } else { "product" }.into());
+            atom.reaction_step = 1;
+            e.mol.atoms.push(atom);
+        }
+        // Each reaction side has an ethane component plus a disconnected oxygen.
+        for (a, b, order) in [(0, 1, 1), (3, 4, 1)] {
+            e.mol.bonds.push(Bond {
+                a,
+                b,
+                order,
+                style: BondStyle::Normal,
+                stereo: None,
+                query: None,
+            });
+        }
+        e.selected_atoms = (0..6).collect();
+        e.start_auto_atom_mapping("Complete");
+        let (captured, rx) = e.calc_rx.take().expect("mapping job should be queued");
+        let report = rx
+            .recv_timeout(std::time::Duration::from_secs(40))
+            .expect("mapping worker should finish")
+            .expect("optional mapper should complete");
+        assert_eq!(captured, e.mol);
+        e.apply_auto_atom_mapping(&report, &[0, 1, 2], &[3, 4, 5], "Complete");
+        assert!(e.mol.atoms[..3].iter().all(|atom| atom.atom_map.is_some()));
+        assert!(e.mol.atoms[3..].iter().all(|atom| atom.atom_map.is_some()));
+        assert_eq!(e.mol.atoms[0].atom_map, e.mol.atoms[3].atom_map);
+        assert_eq!(e.mol.atoms[1].atom_map, e.mol.atoms[4].atom_map);
+        assert_eq!(e.mol.atoms[2].atom_map, e.mol.atoms[5].atom_map);
+        let mapped = e.mol.clone();
+        e.undo();
+        assert!(e.mol.atoms.iter().all(|atom| atom.atom_map.is_none()));
+        e.redo();
+        assert_eq!(e.mol, mapped);
+    }
+
+    #[test]
+    fn automatic_mapping_refuses_selected_agents_and_cross_step_components() {
+        let mut editor = Editor::new();
+        for (role, step) in [("reactant", 1), ("product", 1), ("agent", 1)] {
+            let mut atom = Atom::new(vec2(editor.mol.atoms.len() as f32 * 40., 0.), "C");
+            atom.reaction_role = Some(role.into());
+            atom.reaction_step = step;
+            editor.mol.atoms.push(atom);
+        }
+        editor.selected_atoms = vec![0, 1, 2];
+        let before = editor.mol.clone();
+        editor.start_auto_atom_mapping("Complete");
+        assert_eq!(editor.mol, before);
+        assert!(editor.calc_rx.is_none());
+        assert!(editor.auto_map_pending.is_none());
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|message| message.contains("reactant or product")));
+
+        editor.mol.atoms[2].reaction_role = Some("product".into());
+        editor.mol.atoms[2].reaction_step = 2;
+        editor.selected_atoms = vec![0, 1, 2];
+        let before = editor.mol.clone();
+        editor.start_auto_atom_mapping("Complete");
+        assert_eq!(editor.mol, before);
+        assert!(editor.calc_rx.is_none());
+        assert!(editor.auto_map_pending.is_none());
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .is_some_and(|message| message.contains("same reaction step")));
+    }
+
+    #[test]
+    fn reaction_step_navigation_is_not_limited_to_three_steps() {
+        let mut editor = Editor::new();
+        for _ in 0..5 {
+            editor.graphics.push(Graphic::Arrow {
+                start: vec2(200., 100.),
+                end: vec2(300., 100.),
+                kind: "reaction".into(),
+                above: String::new(),
+                below: String::new(),
+            });
+        }
+        editor.menu_action("View next reaction step");
+        assert_eq!(editor.reaction_step_view, Some(2));
+        for _ in 0..5 {
+            editor.menu_action("View next reaction step");
+        }
+        assert_eq!(editor.reaction_step_view, Some(5));
+        editor.menu_action("View previous reaction step");
+        assert_eq!(editor.reaction_step_view, Some(4));
+        editor.menu_action("View all reaction steps");
+        assert_eq!(editor.reaction_step_view, None);
+    }
+
+    #[test]
+    fn topological_descriptor_command_displays_computed_method_and_values() {
+        let mut editor = Editor::new();
+        let carbon = editor.add_atom(vec2(0., 0.), "C");
+        let oxygen = editor.add_atom(vec2(40., 0.), "O");
+        editor.add_bond(carbon, oxygen, 1);
+        editor.menu_action("Local topological descriptors");
+        let report = editor.info_overlay.unwrap();
+        assert!(report.contains("Wiener index: 1"));
+        assert!(report.contains("First Zagreb index (M₁): 2"));
+        assert!(report.contains("Randić connectivity index"));
+        assert!(report.contains("explicit hydrogens excluded"));
     }
 
     #[test]
@@ -8808,11 +13941,53 @@ mod tests {
             .contains("tautomer-report"));
         e.menu_action("Enumerate stereoisomers");
         assert!(e.calc_rx.is_some());
+        assert!(e.status.contains("Wait for the current background"));
         assert!(e
             .info_overlay
             .as_deref()
             .unwrap()
-            .contains("stereoisomer-report"));
+            .contains("tautomer-report"));
+    }
+
+    #[test]
+    fn gasteiger_command_runs_in_background_without_mutating_the_molecule() {
+        let python = std::env::var("MOLECULA_PYTHON").unwrap_or_else(|_| "python3".into());
+        let available = Command::new(python)
+            .args(["-c", "import rdkit"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            return;
+        }
+        let mut e = Editor::new();
+        for (i, element) in ["C", "C", "O"].into_iter().enumerate() {
+            e.add_atom(vec2(i as f32 * BOND, 0.), element);
+        }
+        e.add_bond(0, 1, 1);
+        e.add_bond(1, 2, 1);
+        let before = e.mol.clone();
+        e.menu_action("Gasteiger partial charges");
+        let (captured, rx) = e
+            .calc_rx
+            .take()
+            .expect("calculation should be queued in background");
+        let report = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured, before);
+        assert_eq!(e.mol, before);
+        assert!(report.contains("METHOD\tGasteiger-Marsili"));
+        assert!(report.contains("SUMMARY\tNet model charge"));
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.starts_with("ATOM\t"))
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -8920,6 +14095,42 @@ mod tests {
     }
 
     #[test]
+    fn custom_reaction_coefficient_edits_component_and_validates_range() {
+        let mut e = Editor::new();
+        let a = e.add_atom(vec2(0., 0.), "C");
+        let b = e.add_atom(vec2(40., 0.), "O");
+        let c = e.add_atom(vec2(200., 0.), "C");
+        let d = e.add_atom(vec2(240., 0.), "O");
+        e.add_bond(a, b, 1);
+        e.add_bond(c, d, 1);
+        e.selected_atoms = vec![a];
+        e.menu_action("Reaction coefficient: custom");
+        assert!(matches!(
+            e.text_target,
+            Some(TextTarget::ReactionCoefficient)
+        ));
+        e.text_buffer = "42".into();
+        e.commit_text();
+        assert_eq!(
+            e.mol
+                .atoms
+                .iter()
+                .map(|atom| atom.coefficient)
+                .collect::<Vec<_>>(),
+            vec![42, 42, 1, 1]
+        );
+        e.undo();
+        assert!(e.mol.atoms.iter().all(|atom| atom.coefficient == 1));
+
+        e.selected_atoms = vec![a];
+        e.text_target = Some(TextTarget::ReactionCoefficient);
+        e.text_buffer = "100".into();
+        e.commit_text();
+        assert!(e.mol.atoms.iter().all(|atom| atom.coefficient == 1));
+        assert!(e.status.contains("from 1 to 99"));
+    }
+
+    #[test]
     fn automatic_reaction_balance_updates_coefficients_and_undo_restores_them() {
         let mut e = Editor::new();
         for (element, x, role) in [
@@ -8967,6 +14178,72 @@ mod tests {
     }
 
     #[test]
+    fn automatic_balance_all_steps_is_atomic_and_undoable() {
+        let mut e = Editor::new();
+        for step in 1..=2 {
+            let y = step as f32 * 220.0;
+            let offset = e.mol.atoms.len();
+            for (element, x, role) in [
+                ("H", 80., "reactant"),
+                ("H", 90., "reactant"),
+                ("O", 120., "reactant"),
+                ("O", 130., "reactant"),
+                ("O", 420., "product"),
+                ("H", 410., "product"),
+                ("H", 430., "product"),
+            ] {
+                let mut atom = Atom::new(vec2(x, y), element);
+                atom.reaction_role = Some(role.into());
+                atom.reaction_step = step;
+                e.mol.atoms.push(atom);
+            }
+            for (a, b, order) in [(0, 1, 1), (2, 3, 2), (4, 5, 1), (4, 6, 1)] {
+                e.mol.bonds.push(Bond {
+                    a: offset + a,
+                    b: offset + b,
+                    order,
+                    style: BondStyle::Normal,
+                    stereo: None,
+                    query: None,
+                });
+            }
+            e.graphics.push(Graphic::Arrow {
+                start: vec2(220., y),
+                end: vec2(300., y),
+                kind: "reaction".into(),
+                above: String::new(),
+                below: String::new(),
+            });
+        }
+        e.menu_action("Auto-balance all reaction steps");
+        assert_eq!(e.mol.atoms[0].coefficient, 2);
+        assert_eq!(e.mol.atoms[7].coefficient, 2);
+        assert!(e
+            .info_overlay
+            .as_deref()
+            .unwrap()
+            .contains("all 2 reaction steps"));
+        e.undo();
+        assert!(e.mol.atoms.iter().all(|atom| atom.coefficient == 1));
+
+        // If a later step cannot be solved, an earlier valid step stays untouched.
+        e.graphics.push(Graphic::Arrow {
+            start: vec2(220., 700.),
+            end: vec2(300., 700.),
+            kind: "reaction".into(),
+            above: String::new(),
+            below: String::new(),
+        });
+        e.menu_action("Auto-balance all reaction steps");
+        assert!(e.mol.atoms.iter().all(|atom| atom.coefficient == 1));
+        assert!(e
+            .info_overlay
+            .as_deref()
+            .unwrap()
+            .contains("No coefficients were changed"));
+    }
+
+    #[test]
     fn save_open_and_export_workflow_uses_real_files() {
         let base = std::env::temp_dir().join(format!(
             "molecula-e2e-{}-{}",
@@ -8978,6 +14255,7 @@ mod tests {
         ));
         let mols = base.with_extension("mols");
         let mol = base.with_extension("mol");
+        let cml_path = base.with_extension("cml");
         let svg = base.with_extension("svg");
 
         let mut original = Editor::new();
@@ -9002,6 +14280,8 @@ mod tests {
         assert_eq!(reopened.graphics, original.graphics);
 
         reopened.save(mol.to_str().unwrap());
+        assert!(reopened.pending_export.is_some());
+        reopened.save_confirmed(mol.to_str().unwrap());
         assert!(reopened.status.starts_with("Saved "), "{}", reopened.status);
         let mol_data = fs::read_to_string(&mol).unwrap();
         let imported = parse_mol_at(&mol_data, vec2(300., 300.)).unwrap();
@@ -9009,6 +14289,22 @@ mod tests {
         assert_eq!(imported.bonds.len(), 1);
         assert_eq!(imported.atoms[0].isotope, Some(13));
         assert_eq!(imported.atoms[1].charge, -1);
+
+        let mut cml_editor = Editor::new();
+        cml_editor.mol = reopened.mol.clone();
+        cml_editor.graphics.clear();
+        cml_editor.save(cml_path.to_str().unwrap());
+        assert!(
+            cml_editor.status.starts_with("Exported "),
+            "{}",
+            cml_editor.status
+        );
+        let cml_data = fs::read_to_string(&cml_path).unwrap();
+        let cml_reopened = cml::parse(&cml_data, vec2(300., 300.)).unwrap();
+        assert_eq!(cml_reopened.atoms.len(), 2);
+        assert_eq!(cml_reopened.bonds.len(), 1);
+        assert_eq!(cml_reopened.atoms[0].isotope, Some(13));
+        assert_eq!(cml_reopened.atoms[1].charge, -1);
 
         reopened
             .write_svg(svg.to_str().unwrap(), 1920., 1080.)
@@ -9018,7 +14314,7 @@ mod tests {
         assert!(svg_data.contains("<line "));
         assert!(svg_data.contains(">heat</text>"));
 
-        for path in [mols, mol, svg] {
+        for path in [mols, mol, cml_path, svg] {
             let _ = fs::remove_file(path);
         }
     }
