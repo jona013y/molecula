@@ -258,6 +258,46 @@ pub fn polyprotic_titration_curve(
         .collect()
 }
 
+/// Analyze measured monoprotic acid titration data. Inputs are added titrant
+/// volume (mL) and measured pH. Equivalence is estimated by the largest
+/// adjacent-point slope; pKa is interpolated at half that volume.
+pub fn analyze_monoprotic_titration_data(data: &[(f64, f64)]) -> Result<(f64, f64, f64), String> {
+    if data.len() < 5 || data.len() > 2000 {
+        return Err("Enter 5 to 2000 measured volume,pH pairs".into());
+    }
+    for (i, &(volume, ph)) in data.iter().enumerate() {
+        if !volume.is_finite() || volume < 0.0 || !ph.is_finite() || !(-2.0..=16.0).contains(&ph) {
+            return Err(
+                "Volumes must be finite and non-negative; measured pH must be between -2 and 16"
+                    .into(),
+            );
+        }
+        if i > 0 && volume <= data[i - 1].0 {
+            return Err("Titrant volumes must be strictly increasing".into());
+        }
+    }
+    let (index, slope) = data
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| (i, (pair[1].1 - pair[0].1) / (pair[1].0 - pair[0].0)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .ok_or("No adjacent data points")?;
+    if slope <= 0.0 {
+        return Err("Measured pH must increase overall for a strong-base titration".into());
+    }
+    let (v0, _) = data[index];
+    let (v1, _) = data[index + 1];
+    let eq = (v0 + v1) / 2.0;
+    let half = eq / 2.0;
+    let bracket = data
+        .windows(2)
+        .find(|pair| pair[0].0 <= half && half <= pair[1].0)
+        .ok_or("Measurements must bracket the half-equivalence volume to estimate pKa")?;
+    let fraction = (half - bracket[0].0) / (bracket[1].0 - bracket[0].0);
+    let pka = bracket[0].1 + fraction * (bracket[1].1 - bracket[0].1);
+    Ok((eq, pka, slope))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +353,34 @@ mod tests {
         assert!(curve
             .iter()
             .all(|(volume, ph)| volume.is_finite() && ph.is_finite()));
+    }
+
+    #[test]
+    fn measured_titration_analysis_finds_equivalence_and_half_equivalence_pka() {
+        let data = [
+            (0.0, 2.1),
+            (2.0, 2.4),
+            (4.0, 2.8),
+            (6.0, 3.2),
+            (8.0, 4.1),
+            (9.0, 5.0),
+            (10.0, 8.8),
+            (11.0, 10.8),
+            (12.0, 11.5),
+        ];
+        let (equivalence, pka, slope) = analyze_monoprotic_titration_data(&data).unwrap();
+        assert_eq!(equivalence, 9.5);
+        assert!((pka - 2.95).abs() < 1e-12);
+        assert!((slope - 3.8).abs() < 1e-12);
+        assert!(analyze_monoprotic_titration_data(&data[..4]).is_err());
+        assert!(analyze_monoprotic_titration_data(&[
+            (0.0, 2.0),
+            (1.0, 3.0),
+            (1.0, 4.0),
+            (2.0, 5.0),
+            (3.0, 6.0)
+        ])
+        .is_err());
     }
 
     #[test]

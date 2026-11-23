@@ -15,6 +15,173 @@ pub enum BasicCalculation {
     PohFromPh,
 }
 
+/// Converts common Chemistry A laboratory units through SI base units.
+pub fn convert_unit(input: &str, danish: bool, figures: u8) -> Result<String, String> {
+    let fields: Vec<_> = input.split(';').map(str::trim).collect();
+    if fields.len() != 3 {
+        return Err(if danish {
+            "Indtast tal; fra-enhed; til-enhed"
+        } else {
+            "Enter value; from-unit; to-unit"
+        }
+        .into());
+    }
+    let value: f64 = fields[0]
+        .replace(',', ".")
+        .parse()
+        .map_err(|_| "Invalid number")?;
+    if !value.is_finite() {
+        return Err("Value must be finite".into());
+    }
+    let unit = |symbol: &str| -> Option<(&'static str, f64)> {
+        match symbol.trim().to_ascii_lowercase().as_str() {
+            "l" => Some(("volume", 1.0)),
+            "ml" => Some(("volume", 1e-3)),
+            "µl" | "μl" | "ul" => Some(("volume", 1e-6)),
+            "m³" | "m3" => Some(("volume", 1e3)),
+            "g" => Some(("mass", 1.0)),
+            "mg" => Some(("mass", 1e-3)),
+            "kg" => Some(("mass", 1e3)),
+            "µg" | "μg" | "ug" => Some(("mass", 1e-6)),
+            "mol" => Some(("amount", 1.0)),
+            "mmol" => Some(("amount", 1e-3)),
+            "µmol" | "μmol" | "umol" => Some(("amount", 1e-6)),
+            "mol/l" | "mol·l⁻¹" | "m" => Some(("concentration", 1.0)),
+            "mmol/l" | "mm" => Some(("concentration", 1e-3)),
+            "µmol/l" | "μmol/l" | "um" => Some(("concentration", 1e-6)),
+            "g/l" => Some(("mass concentration", 1.0)),
+            "mg/ml" => Some(("mass concentration", 1.0)),
+            "mg/l" => Some(("mass concentration", 1e-3)),
+            "k" => Some(("temperature", 1.0)),
+            "°c" | "c" => Some(("temperature_celsius", 1.0)),
+            _ => None,
+        }
+    };
+    let (from_dim, from_factor) =
+        unit(fields[1]).ok_or_else(|| format!("Unsupported unit: {}", fields[1]))?;
+    let (to_dim, to_factor) =
+        unit(fields[2]).ok_or_else(|| format!("Unsupported unit: {}", fields[2]))?;
+    let result = match (from_dim, to_dim) {
+        ("temperature", "temperature") => value * from_factor / to_factor,
+        ("temperature_celsius", "temperature_celsius") => value,
+        ("temperature_celsius", "temperature") => (value + 273.15) / to_factor,
+        ("temperature", "temperature_celsius") => value * from_factor - 273.15,
+        (a, b) if a == b => value * from_factor / to_factor,
+        _ => {
+            return Err(format!(
+                "Incompatible units: {} and {}",
+                fields[1], fields[2]
+            ))
+        }
+    };
+    if !result.is_finite() {
+        return Err("Converted value is outside the supported range".into());
+    }
+    let f = format_significant_locale(result, figures, danish);
+    Ok(format!("{}\n\n{} {} = {} {}\nMethod: exact unit scale factors; no experimental uncertainty included. Displayed precision: {figures} significant figures.", if danish {"Enhedsomregning"} else {"Unit conversion"}, format_significant_locale(value, figures, danish), fields[1], f, fields[2]))
+}
+
+/// First-order propagation of independent standard uncertainties.
+pub fn propagate_uncertainty(input: &str, danish: bool, figures: u8) -> Result<String, String> {
+    let fields: Vec<_> = input.split(';').map(str::trim).collect();
+    let operation = fields.first().copied().unwrap_or("").to_ascii_lowercase();
+    let expected = match operation.as_str() {
+        "add" | "subtract" | "multiply" | "divide" => 5,
+        "log10" | "ph" => 3,
+        _ => {
+            return Err(if danish {
+                "Brug add, subtract, multiply, divide, log10 eller pH"
+            } else {
+                "Use add, subtract, multiply, divide, log10 or pH"
+            }
+            .into())
+        }
+    };
+    if fields.len() != expected {
+        return Err(if danish {
+            "Format: operation; x; u(x); y; u(y), eller operation; x; u(x)"
+        } else {
+            "Format: operation; x; u(x); y; u(y), or operation; x; u(x)"
+        }
+        .into());
+    }
+    let nums: Vec<f64> = fields[1..]
+        .iter()
+        .map(|s| {
+            s.replace(',', ".")
+                .parse::<f64>()
+                .map_err(|_| format!("Invalid number: {s}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if nums.iter().any(|x| !x.is_finite()) {
+        return Err("Measurements and uncertainties must be finite".into());
+    }
+    if nums.iter().skip(1).step_by(2).any(|u| *u < 0.0) {
+        return Err("Uncertainties cannot be negative".into());
+    }
+    let (value, uncertainty, equation) = match operation.as_str() {
+        "add" | "subtract" => {
+            let (x, ux, y, uy) = (nums[0], nums[1], nums[2], nums[3]);
+            (
+                if operation == "add" { x + y } else { x - y },
+                ux.hypot(uy),
+                if operation == "add" {
+                    "z=x+y; u(z)=√(u(x)²+u(y)²)"
+                } else {
+                    "z=x−y; u(z)=√(u(x)²+u(y)²)"
+                },
+            )
+        }
+        "multiply" => {
+            let (x, ux, y, uy) = (nums[0], nums[1], nums[2], nums[3]);
+            (
+                (x * y),
+                (y * ux).hypot(x * uy),
+                "z=xy; u(z)=√((y·u(x))²+(x·u(y))²)",
+            )
+        }
+        "divide" => {
+            let (x, ux, y, uy) = (nums[0], nums[1], nums[2], nums[3]);
+            if y == 0.0 {
+                return Err("Divisor must not be zero".into());
+            };
+            (
+                x / y,
+                ((ux / y).powi(2) + (x * uy / y.powi(2)).powi(2)).sqrt(),
+                "z=x/y; first-order independent-error propagation",
+            )
+        }
+        "log10" | "ph" => {
+            let (x, ux) = (nums[0], nums[1]);
+            if x <= 0.0 || ux >= x {
+                return Err(
+                    "For log10/pH, x must be positive and its uncertainty smaller than x".into(),
+                );
+            }
+            let sign = if operation == "ph" { -1.0 } else { 1.0 };
+            (
+                sign * x.log10(),
+                ux / (x * std::f64::consts::LN_10),
+                if operation == "ph" {
+                    "pH=−log₁₀(x); u(pH)≈u(x)/(x·ln 10)"
+                } else {
+                    "y=log₁₀(x); u(y)≈u(x)/(x·ln 10)"
+                },
+            )
+        }
+        _ => unreachable!(),
+    };
+    if !value.is_finite() || !uncertainty.is_finite() {
+        return Err("Result is outside the supported range".into());
+    }
+    let formatted_value = if operation == "ph" {
+        format_log_quantity(value, figures, danish)
+    } else {
+        format_significant_locale(value, figures, danish)
+    };
+    Ok(format!("{}\n\nResult = {} ± {} (1σ)\nModel: {equation}\nAssumption: independent input uncertainties; first-order propagation. Correlated errors and systematic calibration uncertainty are not included.", if danish {"Usikkerhedsberegning"} else {"Uncertainty propagation"}, formatted_value, format_significant_locale(uncertainty, figures, danish)))
+}
+
 impl BasicCalculation {
     pub const ALL: [Self; 10] = [
         Self::AmountFromMass,
@@ -544,9 +711,9 @@ pub fn stoichiometric_yield(input: &str, danish: bool, figures: u8) -> Result<St
             }
         },
         if danish {
-            "Forudsætning: den indtastede ligning er afstemt, og koefficienterne følger reaktanterne i samme rækkefølge. Renheds- og sideproduktkorrektioner er ikke medregnet."
+            "Forudsætning: ligningen skal være afstemt, og koefficienterne følger reaktanterne i samme rækkefølge. Kontrollér Beregninger → Reaktionsanalyse; brug Afstem reaktion automatisk, før du fortsætter, hvis ligningen ikke stemmer. Tvetydige ligninger afstemmes ikke ved gæt. Renheds- og sideproduktkorrektioner er ikke medregnet."
         } else {
-            "Assumption: the entered equation is balanced, and coefficients match reactants in the same order. Purity and side-product corrections are not included."
+            "Assumption: the equation must be balanced, and coefficients match reactants in the same order. Check Calculations → Reaction analysis; use Auto-balance reaction before continuing if it is unbalanced. Ambiguous equations are not balanced by guessing. Purity and side-product corrections are not included."
         }
     );
     output.push_str(&if danish {
@@ -609,6 +776,28 @@ mod tests {
         assert_eq!(format_significant(0.1, 4), "0.1000");
         assert_eq!(format_log_quantity(3.0, 4, false), "3.0000");
         assert_eq!(format_log_quantity(5.061, 4, true), "5,0610");
+    }
+
+    #[test]
+    fn chemistry_a_unit_conversion_checks_dimensions_and_converts_lab_values() {
+        let report = convert_unit("25; mL; L", false, 4).unwrap();
+        assert!(report.contains("25.00 mL = 0.02500 L"));
+        assert!(convert_unit("1; g; L", false, 4).is_err());
+        assert!(convert_unit("NaN; mL; L", false, 4).is_err());
+        assert!(convert_unit("0; °C; K", false, 5)
+            .unwrap()
+            .contains("273.15 K"));
+    }
+
+    #[test]
+    fn independent_measurement_uncertainty_uses_first_order_propagation() {
+        let division =
+            propagate_uncertainty("divide; 0.100; 0.001; 0.050; 0.001", false, 4).unwrap();
+        assert!(division.contains("2.000 ± 0.04472 (1σ)"));
+        let ph = propagate_uncertainty("pH; 0.001; 0.00001", false, 3).unwrap();
+        assert!(ph.contains("3.000 ± 0.00434"));
+        assert!(propagate_uncertainty("divide; 1; 0; 0; 0", false, 4).is_err());
+        assert!(propagate_uncertainty("add; 1; -0.1; 2; 0.1", false, 4).is_err());
     }
 
     #[test]

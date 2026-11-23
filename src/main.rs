@@ -547,6 +547,16 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Bjerrum diagram data" => "Bjerrumdiagram-data",
         "Polyprotic titration pH" => "pH ved polyprot titrering",
         "Polyprotic titration curve" => "Polyprot titrerkurve",
+        "Unit conversion" => "Enhedsomregning",
+        "Uncertainty propagation" => "Usikkerhedsberegning",
+        "Analyze measured titration data" => "Analysér målte titreringsdata",
+        "Measured titration data" => "Målte titreringsdata",
+        "Added titrant (mL)" => "Tilsat titrant (mL)",
+        "Equivalence" => "Ækvivalenspunkt",
+        "Half-equivalence" => "Halvækvivalenspunkt",
+        "Export calculation report as PDF" => "Eksportér beregningsrapport som PDF",
+        "Export calculation report as CSV" => "Eksportér beregningsrapport som CSV",
+        "No calculation report is available yet" => "Der er ingen beregningsrapport endnu",
         "Bjerrum diagram · species distribution" => "Bjerrumdiagram · artsfordeling",
         "Fraction (%)" => "Andel (%)",
         "Added strong base (mL)" => "Tilsat stærk base (mL)",
@@ -564,10 +574,18 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Example: 2.15|7.20; 0; 14; 0.5" => "Eksempel: 2,15|7,20; 0; 14; 0,5",
         "Example: 4.76; 25; 0.10; 0.10; 12.5" => "Eksempel: 4,76; 25; 0,10; 0,10; 12,5",
         "Example: 4.76; 25; 0.10; 0.10; 1.5" => "Eksempel: 4,76; 25; 0,10; 0,10; 1,5",
+        "Example: 25; mL; L" => "Eksempel: 25; mL; L",
+        "Example: divide; 0.100; 0.001; 0.050; 0.001" => "Eksempel: divide; 0,100; 0,001; 0,050; 0,001",
+        "Example: 0:2.1; 2:2.4; 4:2.8; 6:3.2; 8:4.1; 9:5.0; 10:8.8; 11:10.8; 12:11.5" => "Eksempel: 0:2,1; 2:2,4; 4:2,8; 6:3,2; 8:4,1; 9:5,0; 10:8,8; 11:10,8; 12:11,5",
         "pKa values (in increasing order) separated by |; then pH" => "pKa-værdier i stigende rækkefølge adskilt af |; derefter pH",
         "pKa values separated by |; pH minimum; maximum; step" => "pKa-værdier adskilt af |; pH minimum; maksimum; trin",
         "pKa values separated by |; acid volume mL; acid M; base M; added base volume mL" => "pKa-værdier adskilt af |; syrevolumen mL; syre M; base M; tilsat basevolumen mL",
         "pKa values separated by |; acid volume mL; acid M; base M; max equivalents" => "pKa-værdier adskilt af |; syrevolumen mL; syre M; base M; maks. ækvivalenter",
+        "Value; from unit; to unit (e.g. 25; mL; L)" => "Værdi; fra-enhed; til-enhed (fx 25; mL; L)",
+        "operation; x; u(x); y; u(y), or operation; x; u(x)" => "operation; x; u(x); y; u(y), eller operation; x; u(x)",
+        "Enter added titrant volume in mL and measured pH as volume:pH pairs separated by semicolons" => "Indtast tilsat titrantvolumen i mL og målt pH som volumen:pH-par adskilt af semikolon",
+        "Save calculation report" => "Gem beregningsrapport",
+        "Choose the matching .pdf or .csv extension." => "Vælg den tilsvarende filendelse .pdf eller .csv.",
         "Buffer pH (pKa; acid M; conjugate base M)" => "Buffer-pH (pKa; syre M; korresponderende base M)",
         "Measured pH; acid M; conjugate base M" => "Målt pH; syre M; korresponderende base M",
         "pKa of conjugate acid; total base concentration M" => "pKa for korresponderende syre; total basekoncentration M",
@@ -591,8 +609,8 @@ fn localized<'a>(language: Language, source: &'a str) -> Cow<'a, str> {
         "Reaction coefficient: custom" => "Reaktionskoefficient: brugerdefineret",
         "Gasteiger partial charges" => "Gasteiger-partialladninger",
         "Set a whole-number coefficient from 1 to 99 for this component." => "Angiv en heltalskoefficient fra 1 til 99 for denne komponent.",
-        "Auto-balance reaction" => "Afstem reaktion automatisk",
         "Auto-balance all reaction steps" => "Afstem alle reaktionstrin automatisk",
+        "Auto-balance reaction" => "Afstem reaktion automatisk",
         "View previous reaction step" => "Vis forrige reaktionstrin",
         "View next reaction step" => "Vis næste reaktionstrin",
         "View all reaction steps" => "Vis alle reaktionstrin",
@@ -1488,10 +1506,18 @@ enum TextTarget {
     PolyproticTitrationPh,
     PolyproticTitrationCurve,
     StoichiometryYield,
+    UnitConversion,
+    UncertaintyPropagation,
+    MeasuredTitrationData,
     BasicCalculation(kemi_a::BasicCalculation),
     TutorQuestion,
     ChemistryAAnswer(usize),
     StudySearch,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalculationReportFormat {
+    Pdf,
+    Csv,
 }
 fn acid_base_prompt(target: TextTarget, language: Language) -> Option<String> {
     if let TextTarget::BasicCalculation(calculation) = target {
@@ -1519,6 +1545,9 @@ fn acid_base_prompt(target: TextTarget, language: Language) -> Option<String> {
             "pKa values separated by |; acid volume mL; acid M; base M; max equivalents".into(),
         ),
         TextTarget::StoichiometryYield => Some("Reactant coefficients (spaces); reactant amounts mol (spaces); product coefficient; product molar mass g/mol; optional actual product mass g".into()),
+        TextTarget::UnitConversion => Some("Value; from unit; to unit (e.g. 25; mL; L)".into()),
+        TextTarget::UncertaintyPropagation => Some("operation; x; u(x); y; u(y), or operation; x; u(x)".into()),
+        TextTarget::MeasuredTitrationData => Some("Enter added titrant volume in mL and measured pH as volume:pH pairs separated by semicolons".into()),
         _ => None,
     }
 }
@@ -1537,6 +1566,13 @@ fn acid_base_example(target: TextTarget, language: Language) -> Option<String> {
         TextTarget::PolyproticTitrationPh => Some("Example: 4.76; 25; 0.10; 0.10; 12.5".into()),
         TextTarget::PolyproticTitrationCurve => Some("Example: 4.76; 25; 0.10; 0.10; 1.5".into()),
         TextTarget::StoichiometryYield => Some("Example: 2 1; 0.30 0.10; 2; 18.015; 3.20".into()),
+        TextTarget::UnitConversion => Some("Example: 25; mL; L".into()),
+        TextTarget::UncertaintyPropagation => {
+            Some("Example: divide; 0.100; 0.001; 0.050; 0.001".into())
+        }
+        TextTarget::MeasuredTitrationData => Some(
+            "Example: 0:2,1; 2:2,4; 4:2,8; 6:3,2; 8:4,1; 9:5,0; 10:8,8; 11:10,8; 12:11,5".into(),
+        ),
         _ => None,
     }
 }
@@ -1811,6 +1847,7 @@ struct ChemistryChart {
     y_label: String,
     series: Vec<String>,
     points: Vec<(f64, Vec<f64>)>,
+    markers: Vec<(f64, String)>,
 }
 fn chemistry_chart_csv(chart: &ChemistryChart) -> String {
     let mut csv = chart.x_label.clone();
@@ -1901,6 +1938,8 @@ struct Editor {
     chemistry_a_progress: BTreeSet<usize>,
     acid_base_open: bool,
     acid_base_chart: Option<ChemistryChart>,
+    last_calculation_report: Option<String>,
+    calculation_report_export: Option<CalculationReportFormat>,
     info_scroll: usize,
     lesson: Option<TeachingLesson>,
     lesson_open: bool,
@@ -2098,6 +2137,8 @@ impl Editor {
             chemistry_a_progress: load_chemistry_a_progress(),
             acid_base_open: false,
             acid_base_chart: None,
+            last_calculation_report: None,
+            calculation_report_export: None,
             info_scroll: 0,
             lesson: None,
             lesson_open: false,
@@ -5003,6 +5044,54 @@ impl Editor {
         }
         self.save_confirmed(path);
     }
+    fn start_calculation_report_export(&mut self, format: CalculationReportFormat) {
+        if self.last_calculation_report.is_none() {
+            self.info_overlay = Some(
+                localized(self.language, "No calculation report is available yet").into_owned(),
+            );
+            return;
+        }
+        self.calculation_report_export = Some(format);
+        self.path_input = format!(
+            "{}/Documents/kemi-a-report.{}",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+            match format {
+                CalculationReportFormat::Pdf => "pdf",
+                CalculationReportFormat::Csv => "csv",
+            }
+        );
+        self.file_dialog = Some(true);
+    }
+    fn save_calculation_report(&mut self, path: &str) {
+        let Some(report) = self.last_calculation_report.as_deref() else {
+            self.status =
+                localized(self.language, "No calculation report is available yet").into_owned();
+            return;
+        };
+        let lower = path.to_ascii_lowercase();
+        let result = match self.calculation_report_export {
+            Some(CalculationReportFormat::Pdf) if lower.ends_with(".pdf") => {
+                fs::write(path, render_text_pdf(report))
+            }
+            Some(CalculationReportFormat::Csv) if lower.ends_with(".csv") => {
+                fs::write(path, calculation_report_csv(report))
+            }
+            Some(CalculationReportFormat::Pdf) => {
+                self.status = "Choose a .pdf filename".into();
+                return;
+            }
+            Some(CalculationReportFormat::Csv) => {
+                self.status = "Choose a .csv filename".into();
+                return;
+            }
+            None => return,
+        };
+        self.status = match result {
+            Ok(()) => format!("Saved calculation report: {path}"),
+            Err(error) => format!("Could not save calculation report: {error}"),
+        };
+        self.calculation_report_export = None;
+    }
     fn save_confirmed(&mut self, path: &str) {
         let lower = path.to_lowercase();
         let export_only = [
@@ -5532,7 +5621,10 @@ impl Editor {
                 | TextTarget::BjerrumDiagram
                 | TextTarget::PolyproticTitrationPh
                 | TextTarget::PolyproticTitrationCurve
-                | TextTarget::StoichiometryYield => {
+                | TextTarget::StoichiometryYield
+                | TextTarget::UnitConversion
+                | TextTarget::UncertaintyPropagation
+                | TextTarget::MeasuredTitrationData => {
                     self.calculate_acid_base(target, &self.text_buffer.clone());
                     self.text_buffer.clear();
                     return;
@@ -5549,6 +5641,7 @@ impl Editor {
                         )
                         .unwrap_or_else(|error| localize_kemi_a_error(&error, danish)),
                     );
+                    self.last_calculation_report = self.info_overlay.clone();
                     self.info_scroll = 0;
                     self.text_buffer.clear();
                     return;
@@ -5629,6 +5722,9 @@ impl Editor {
                 | TextTarget::PolyproticTitrationPh
                 | TextTarget::PolyproticTitrationCurve
                 | TextTarget::StoichiometryYield
+                | TextTarget::UnitConversion
+                | TextTarget::UncertaintyPropagation
+                | TextTarget::MeasuredTitrationData
                 | TextTarget::BasicCalculation(_)
                 | TextTarget::TutorQuestion
                 | TextTarget::StudySearch
@@ -5791,6 +5887,7 @@ impl Editor {
                                 )
                             })
                             .collect(),
+                        markers: Vec::new(),
                     });
                     let mut output = format!(
                         "Bjerrum distribution table\npKa: {}\n\n",
@@ -5879,6 +5976,7 @@ impl Editor {
                             .iter()
                             .map(|(volume, ph)| (volume * 1000.0, vec![*ph]))
                             .collect(),
+                        markers: Vec::new(),
                     });
                     let mut output = format!(
                         "Titration curve points\npKa values: {}\n\nV(base), mL\tpH",
@@ -5898,11 +5996,67 @@ impl Editor {
                     self.language == Language::Danish,
                     self.significant_figures,
                 ),
+                TextTarget::UnitConversion => kemi_a::convert_unit(input, danish, figures),
+                TextTarget::UncertaintyPropagation => {
+                    kemi_a::propagate_uncertainty(input, danish, figures)
+                }
+                TextTarget::MeasuredTitrationData => {
+                    let data = input
+                        .split(';')
+                        .map(str::trim)
+                        .map(|entry| {
+                            let (volume, ph) = entry
+                                .split_once(':')
+                                .ok_or("Use volume:pH pairs separated by semicolons")?;
+                            let parse = |value: &str| {
+                                value
+                                    .trim()
+                                    .replace(',', ".")
+                                    .parse::<f64>()
+                                    .map_err(|_| format!("Invalid measurement: {value}"))
+                            };
+                            Ok::<_, String>((parse(volume)?, parse(ph)?))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let (equivalence_ml, pka, slope) =
+                        acid_base::analyze_monoprotic_titration_data(&data)?;
+                    self.acid_base_chart = Some(ChemistryChart {
+                        title: localized(self.language, "Measured titration data").into_owned(),
+                        x_label: localized(self.language, "Added titrant (mL)").into_owned(),
+                        y_label: "pH".into(),
+                        series: vec!["pH".into()],
+                        points: data.iter().map(|(v, ph)| (*v, vec![*ph])).collect(),
+                        markers: vec![
+                            (
+                                equivalence_ml,
+                                localized(self.language, "Equivalence").into_owned(),
+                            ),
+                            (
+                                equivalence_ml / 2.0,
+                                localized(self.language, "Half-equivalence").into_owned(),
+                            ),
+                        ],
+                    });
+                    let label = if danish {
+                        "Målt titrering"
+                    } else {
+                        "Measured titration"
+                    };
+                    let mut report=format!("{label}\n\nEstimated equivalence volume = {} mL\nEstimated pKa at half-equivalence = {}\nMaximum adjacent-point slope = {} pH/mL\n\nMethod: equivalence volume is the midpoint of the interval with the largest measured ΔpH/ΔV; pKa is linearly interpolated at half that volume. Assumes one monoprotic weak acid titrated with strong base and measurements that span both points. Coarse or noisy data can shift the estimates; this is not a fitted equilibrium model. Measurement uncertainty is not inferred from scatter.", sig(equivalence_ml), log_value(pka), sig(slope));
+                    report.push_str("\n\nMeasured data (titrant volume mL, pH)");
+                    for (volume, ph) in &data {
+                        report.push_str(&format!("\n{},{}", sig(*volume), log_value(*ph)));
+                    }
+                    Ok(report)
+                }
                 _ => Err("This is not an acid/base calculation input".into()),
             }
         })();
         self.info_overlay = Some(match result {
-            Ok(report) => localize_acid_base_report(self.language, report),
+            Ok(report) => {
+                self.last_calculation_report = Some(report.clone());
+                localize_acid_base_report(self.language, report)
+            }
             Err(error) => format!("Acid/base calculation unavailable\n{error}"),
         });
         if self
@@ -6329,6 +6483,11 @@ impl Editor {
         "Reaction coefficient: custom"=>{self.text_buffer.clear();self.text_target=Some(TextTarget::ReactionCoefficient);},
         "Chemistry A acid/base tools"=>self.acid_base_open=true,
         "Chemistry A calculations"=>self.acid_base_open=true,
+        "Unit conversion" => self.start_acid_base_input(TextTarget::UnitConversion),
+        "Uncertainty propagation" => self.start_acid_base_input(TextTarget::UncertaintyPropagation),
+        "Analyze measured titration data" => self.start_acid_base_input(TextTarget::MeasuredTitrationData),
+        "Export calculation report as PDF" => self.start_calculation_report_export(CalculationReportFormat::Pdf),
+        "Export calculation report as CSV" => self.start_calculation_report_export(CalculationReportFormat::Csv),
         "Chemistry A basic tools"=>self.acid_base_open=true,
         "Learning center"=>{
             self.learning_open=true;
@@ -7099,6 +7258,86 @@ fn pdf_escape(s: &str) -> String {
         .replace('\\', "\\\\")
         .replace('(', "\\(")
         .replace(')', "\\)")
+}
+fn calculation_report_csv(report: &str) -> String {
+    let mut csv = String::from("line,calculation_report\r\n");
+    for (index, line) in report.lines().enumerate() {
+        csv.push_str(&(index + 1).to_string());
+        csv.push(',');
+        csv.push('"');
+        csv.push_str(&line.replace('"', "\"\""));
+        csv.push_str("\"\r\n");
+    }
+    csv
+}
+fn render_text_pdf(report: &str) -> Vec<u8> {
+    let mut lines = Vec::new();
+    for line in report.lines() {
+        let mut remaining = line;
+        if remaining.is_empty() {
+            lines.push(String::new());
+        }
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(92);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end < remaining.len() {
+                if let Some(space) = remaining[..end].rfind(' ') {
+                    if space > 50 {
+                        end = space;
+                    }
+                }
+            }
+            lines.push(remaining[..end].to_string());
+            remaining = remaining[end..].trim_start();
+        }
+    }
+    let pages: Vec<_> = lines.chunks(48).collect();
+    let pages = if pages.is_empty() {
+        vec![&[][..]]
+    } else {
+        pages
+    };
+    let mut objects = vec![String::new(); 3 + pages.len() * 2];
+    objects[0] = "<< /Type /Catalog /Pages 2 0 R >>".into();
+    objects[2] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into();
+    let kids = (0..pages.len())
+        .map(|i| format!("{} 0 R", 4 + i * 2))
+        .collect::<Vec<_>>()
+        .join(" ");
+    objects[1] = format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len());
+    for (i, lines) in pages.iter().enumerate() {
+        let page_id = 4 + i * 2;
+        let content_id = page_id + 1;
+        objects[page_id-1]=format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>");
+        let mut stream = String::from("BT /F1 10 Tf 42 560 Td 13 TL\n");
+        for line in lines.iter() {
+            stream += &format!("({}) Tj T*\n", pdf_escape(line));
+        }
+        stream.push_str("ET");
+        objects[content_id - 1] = format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            stream.len(),
+            stream
+        );
+    }
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = vec![0usize];
+    for (i, obj) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf += &format!("{} 0 obj\n{}\nendobj\n", i + 1, obj);
+    }
+    let xref = pdf.len();
+    pdf += &format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+    for offset in offsets.iter().skip(1) {
+        pdf += &format!("{offset:010} 00000 n \n");
+    }
+    pdf += &format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    );
+    pdf.into_bytes()
 }
 fn charge_label(c: i8) -> String {
     match c {
@@ -8711,6 +8950,11 @@ fn menu_items(i: usize) -> &'static [&'static str] {
             "Molecular properties",
             "Local topological descriptors",
             "Chemistry A calculations",
+            "Unit conversion",
+            "Uncertainty propagation",
+            "Analyze measured titration data",
+            "Export calculation report as PDF",
+            "Export calculation report as CSV",
             "Reaction analysis",
             "Auto-balance reaction",
             "Auto-balance all reaction steps",
@@ -11195,7 +11439,7 @@ async fn main() {
         } else if e.acid_base_open {
             draw_rectangle(0., 0., w, h, Color::from_rgba(0, 0, 0, 120));
             let width = 1010.;
-            let height = 620.;
+            let height = 700.;
             let x = (w - width) / 2.;
             let y = (h - height) / 2.;
             round_rect(
@@ -11257,6 +11501,18 @@ async fn main() {
                     TextTarget::StoichiometryYield,
                     localized(e.language, "Limiting reactant & yield").into_owned(),
                 ),
+                (
+                    TextTarget::UnitConversion,
+                    localized(e.language, "Unit conversion").into_owned(),
+                ),
+                (
+                    TextTarget::UncertaintyPropagation,
+                    localized(e.language, "Uncertainty propagation").into_owned(),
+                ),
+                (
+                    TextTarget::MeasuredTitrationData,
+                    localized(e.language, "Analyze measured titration data").into_owned(),
+                ),
             ];
             tools.extend(
                 kemi_a::BasicCalculation::ALL
@@ -11272,8 +11528,8 @@ async fn main() {
             );
             UI_INPUT_ENABLED.with(|enabled| enabled.set(true));
             for (index, (target, label)) in tools.iter().enumerate() {
-                let column = index / 7;
-                let row = index % 7;
+                let column = index / 8;
+                let row = index % 8;
                 if button(
                     x + 22. + column as f32 * 330.,
                     y + 72. + row as f32 * 42.,
@@ -11288,28 +11544,28 @@ async fn main() {
             draw_text(
                 &localized(e.language, "pKa is entered from your class data or a cited table. No structure-based pKa prediction is made."),
                 x + 24.,
-                y + 382.,
+                y + 420.,
                 13.,
                 muted(),
             );
             draw_text(
                 "Aqueous ideal-solution model · 25 °C · Kw = 1.0×10⁻¹⁴ · concentrations in mol/L",
                 x + 24.,
-                y + 404.,
+                y + 442.,
                 13.,
                 muted(),
             );
             draw_text(
                 &localized(e.language, "Choose a calculation, then enter values in the order shown. Use ; between fields and | between successive pKa values."),
                 x + 24.,
-                y + 427.,
+                y + 464.,
                 12.,
                 muted(),
             );
             draw_text(
                 &localized(e.language, "Henderson–Hasselbalch: pH = pKa + log₁₀([A⁻]/[HA]). Charts can copy data as CSV."),
                 x + 24.,
-                y + 449.,
+                y + 486.,
                 12.,
                 muted(),
             );
@@ -11559,6 +11815,36 @@ async fn main() {
                     1.5,
                     ink(),
                 );
+                for (index, (value, label)) in chart.markers.iter().enumerate() {
+                    if *value < x_min || *value > x_max {
+                        continue;
+                    }
+                    let marker_x = plot_x + ((*value - x_min) / (x_max - x_min)) as f32 * plot_w;
+                    let color = if index == 0 {
+                        Color::from_rgba(207, 112, 45, 255)
+                    } else {
+                        Color::from_rgba(54, 120, 190, 255)
+                    };
+                    let mut yy = plot_y;
+                    while yy < plot_y + plot_h {
+                        draw_line(
+                            marker_x,
+                            yy,
+                            marker_x,
+                            (yy + 7.).min(plot_y + plot_h),
+                            1.6,
+                            color,
+                        );
+                        yy += 12.;
+                    }
+                    draw_text(
+                        &format!("{label} · {:.2} mL", value),
+                        (marker_x + 4.).min(plot_x + plot_w - 116.),
+                        plot_y + 15. + index as f32 * 17.,
+                        11.,
+                        color,
+                    );
+                }
                 for (series_index, label) in chart.series.iter().enumerate() {
                     let color = palette[series_index % palette.len()];
                     let mut previous = None;
@@ -12173,17 +12459,15 @@ async fn main() {
             draw_rectangle(dx, dy, 760., 190., WHITE);
             draw_rectangle_lines(dx, dy, 760., 190., 1., GRAY);
             let saving = e.file_dialog == Some(true);
-            draw_text(
-                if saving {
-                    "Save molecule"
-                } else {
-                    "Open MOL, SDF, RXN, SMILES, SMARTS or MOLS"
-                },
-                dx + 22.,
-                dy + 38.,
-                25.,
-                DARKGRAY,
-            );
+            let report_export = e.calculation_report_export.is_some();
+            let dialog_title = if report_export {
+                localized(e.language, "Save calculation report").into_owned()
+            } else if saving {
+                "Save molecule".to_string()
+            } else {
+                "Open MOL, SDF, RXN, SMILES, SMARTS or MOLS".to_string()
+            };
+            draw_text(&dialog_title, dx + 22., dy + 38., 25., DARKGRAY);
             draw_rectangle_lines(dx + 20., dy + 58., 720., 39., 1., accent());
             draw_text(&e.path_input, dx + 29., dy + 84., 20., DARKGRAY);
             while let Some(ch) = get_char_pressed() {
@@ -12196,13 +12480,18 @@ async fn main() {
             }
             if is_key_pressed(KeyCode::Escape) {
                 e.file_dialog = None;
+                e.calculation_report_export = None;
                 e.close_after_save = None;
                 e.quit_when_clean = false;
             }
             if is_key_pressed(KeyCode::Enter) {
                 let path = e.path_input.clone();
                 if saving {
-                    e.request_save(path);
+                    if report_export {
+                        e.save_calculation_report(&path);
+                    } else {
+                        e.request_save(path);
+                    }
                 } else {
                     e.load(&path);
                 }
@@ -12210,6 +12499,7 @@ async fn main() {
             }
             if button(dx + 530., dy + 125., 94., 36., "Cancel", false) {
                 e.file_dialog = None;
+                e.calculation_report_export = None;
                 e.close_after_save = None;
                 e.quit_when_clean = false;
             }
@@ -12223,19 +12513,22 @@ async fn main() {
             ) {
                 let path = e.path_input.clone();
                 if saving {
-                    e.request_save(path);
+                    if report_export {
+                        e.save_calculation_report(&path);
+                    } else {
+                        e.request_save(path);
+                    }
                 } else {
                     e.load(&path);
                 }
                 e.file_dialog = None;
             }
-            draw_text(
-                "Use an absolute path or a path relative to the launch folder.",
-                dx + 20.,
-                dy + 117.,
-                15.,
-                GRAY,
-            );
+            let dialog_hint = if report_export {
+                localized(e.language, "Choose the matching .pdf or .csv extension.").into_owned()
+            } else {
+                "Use an absolute path or a path relative to the launch folder.".to_string()
+            };
+            draw_text(&dialog_hint, dx + 20., dy + 117., 15., GRAY);
         }
         if e.file_dialog.is_none()
             && e.pending_export.is_none()
@@ -13503,6 +13796,64 @@ mod tests {
         assert!(text.starts_with("%PDF-1.4"));
         assert!(text.contains("Tj ET"));
         assert!(text.ends_with("%%EOF\n"));
+    }
+
+    #[test]
+    fn chemistry_a_new_calculators_route_to_outputs_and_mark_measured_curve() {
+        let mut editor = Editor::new();
+        editor.language = Language::English;
+        editor.menu_action("Unit conversion");
+        assert!(matches!(
+            editor.text_target,
+            Some(TextTarget::UnitConversion)
+        ));
+        editor.calculate_acid_base(TextTarget::UnitConversion, "25; mL; L");
+        assert!(editor
+            .info_overlay
+            .as_deref()
+            .unwrap()
+            .contains("0.02500 L"));
+
+        editor.calculate_acid_base(
+            TextTarget::UncertaintyPropagation,
+            "divide; 0.100; 0.001; 0.050; 0.001",
+        );
+        assert!(editor.info_overlay.as_deref().unwrap().contains("0.04472"));
+
+        editor.calculate_acid_base(
+            TextTarget::MeasuredTitrationData,
+            "0:2.1; 2:2.4; 4:2.8; 6:3.2; 8:4.1; 9:5.0; 10:8.8; 11:10.8; 12:11.5",
+        );
+        let chart = editor.acid_base_chart.as_ref().unwrap();
+        assert_eq!(chart.markers.len(), 2);
+        assert!(chart.markers[0].1.contains("Equivalence"));
+        assert!(editor
+            .last_calculation_report
+            .as_deref()
+            .unwrap()
+            .contains("Measured data"));
+        assert!(editor
+            .last_calculation_report
+            .as_deref()
+            .unwrap()
+            .contains("half-equivalence"));
+    }
+
+    #[test]
+    fn calculation_report_pdf_and_csv_are_real_multi_page_exports() {
+        let report = (0..60)
+            .map(|i| format!("Step {i}: x = 1.00 ± 0.01"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pdf = String::from_utf8(render_text_pdf(&report)).unwrap();
+        assert!(pdf.starts_with("%PDF-1.4"));
+        assert!(pdf.contains("/Count 2"));
+        assert!(pdf.contains("Step 59"));
+        assert!(pdf.ends_with("%%EOF\n"));
+        let csv = calculation_report_csv("Formula: H2O\nResult: 1,00 g");
+        assert!(csv.starts_with("line,calculation_report\r\n"));
+        assert!(csv.contains("\"Formula: H2O\""));
+        assert!(csv.contains("\"Result: 1,00 g\""));
     }
 
     #[test]
