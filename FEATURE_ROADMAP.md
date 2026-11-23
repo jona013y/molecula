@@ -125,6 +125,11 @@ All packages A–G were approved by Jonathan (“add all”). They are being imp
 - [x] Add 3–5 significant-figure display precision to basic and acid/base calculation reports, with persisted preference, decimal-comma Danish output, and unrounded internal calculations.
 - [x] Add seven interactive numerical Kemi A exercises with progressive hints, answer grading through shared calculation routines, and locally persisted solved progress.
 - [x] Link reaction-analysis guidance to the yield calculator while explicitly asking learners to enter quantities separately from the drawn reaction.
+- [x] Add dimension-checked conversions for common Kemi A lab units, including volume, mass, substance amount, concentration and temperature.
+- [x] Add first-order propagation of independent measurement uncertainty for arithmetic and logarithmic/pH calculations; report its statistical assumptions.
+- [x] Add measured monoprotic titration analysis, show equivalence and half-equivalence markers, and interpolate pKa at half-equivalence when measured points bracket it.
+- [x] Link limiting-reactant calculations to reaction analysis and the existing unique-solution auto-balancer; explicitly refuse ambiguous systems.
+- [x] Save the latest calculation report as PDF or CSV with displayed equations, results and assumptions.
 - Add a guided, interactive lesson flow for drawing common structures and reactions.
 - Explain naming steps on the canvas and let the learner reveal functional-group priority, parent chain, numbering and prefixes one at a time.
 - Add reaction balancing practice with immediate, evidence-based feedback; do not grade unsupported structures.

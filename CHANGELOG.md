@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.16
+
+- Add dimension-checked Chemistry A unit conversion for common lab volumes, masses, amounts, concentrations and temperature.
+- Add first-order propagation of independent standard uncertainty for arithmetic and logarithmic/pH operations, with method and limitations in the report.
+- Add measured monoprotic titration analysis: estimate equivalence volume from the largest adjacent pH slope, mark equivalence and half-equivalence on the plotted data, and interpolate pKa at half-equivalence.
+- Connect limiting-reactant/yield workflow to reaction analysis and the existing unique-solution auto-balancer; refuse ambiguous systems.
+- Export the latest calculation report as a multi-page PDF or line-by-line CSV, preserving equations, displayed values and assumptions.
+- Add regression tests for unit dimensions and conversions, uncertainty propagation, measured-titration pKa analysis, calculator routing/markers, and PDF/CSV calculation reports.
+- Verify the complete 238-test suite, formatting, Clippy with warnings denied, and an optimized offline release build.
+
 ## v1.0.15
 
 - Add a Chemistry A limiting-reactant and yield calculator for theoretical product amount/mass and optional percent yield from actual mass.
